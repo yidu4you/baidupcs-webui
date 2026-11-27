@@ -616,7 +616,7 @@ PAGES.files = (view, params) => {
 };
 
 // ------------------------------------------------------------ 파일 관련 대화상자
-const DL_DEFAULTS = { overwrite: false, mode: "locate", threads: 0, load: 0, retry: 3, nocheck: false, mtime: true, fullpath: false, test: false, dindex: 0, exec_perm: false, separate: false };
+const DL_DEFAULTS = { overwrite: false, mode: "locate", threads: 0, load: 0, retry: 3, nocheck: false, mtime: true, fullpath: false, test: false, dindex: 0, exec_perm: false, separate: false, extract: false, extract_delete: false };
 
 async function downloadDialog(paths, info) {
   if (!paths.length) return;
@@ -662,6 +662,7 @@ async function downloadDialog(paths, info) {
   const chk = (k, label, sub) => h("label", { class: "check" }, h("input", { type: "checkbox", checked: !!o[k], onchange: (e) => { o[k] = e.target.checked; } }), h("span", null, label, sub && h("small", null, sub)));
   const num = (k, label, help) => h("div", { class: "field" }, h("label", null, label),
     h("input", { class: "input", type: "number", min: 0, value: o[k], oninput: (e) => { o[k] = parseInt(e.target.value || "0", 10); } }), help && h("p", { class: "help" }, help));
+  const pwInput = h("input", { class: "input", placeholder: "비밀번호가 걸린 압축일 때만" });
   const mode = h("select", { class: "input", onchange: (e) => { o.mode = e.target.value; } },
     [["locate", "locate (기본, 권장)"], ["pcs", "pcs"], ["stream", "stream"]].map(([v, l]) => h("option", { value: v, selected: o.mode === v }, l)));
   const list = h("div", { class: "mono muted", style: { maxHeight: "96px", overflow: "auto", marginBottom: "14px" } }, paths.map((p) => h("div", null, p)));
@@ -675,7 +676,10 @@ async function downloadDialog(paths, info) {
       chk("mtime", "원본 수정 시간 유지", "넷디스크의 수정 시간을 그대로 씁니다"),
       chk("fullpath", "넷디스크 전체 경로로 저장", "/영상/a.mp4 → 저장위치/영상/a.mp4"),
       chk("overwrite", "같은 이름 파일 덮어쓰기", "끄면 이미 있는 파일은 건너뜁니다"),
-      paths.length > 1 ? chk("separate", "항목마다 작업 나누기", "작업별로 따로 중지·재시도") : null),
+      paths.length > 1 ? chk("separate", "항목마다 작업 나누기", "작업별로 따로 중지·재시도") : null,
+      chk("extract", "받은 뒤 압축 풀기", "zip·7z·rar (분할 압축 포함), 같은 폴더에 풉니다"),
+      chk("extract_delete", "압축을 푼 뒤 압축 파일 삭제", "풀기에 성공한 것만 지웁니다")),
+    h("div", { class: "field" }, h("label", null, "압축 비밀번호 (선택)"), pwInput),
     h("details", { class: "adv" }, h("summary", null, "고급 옵션"),
       h("div", { class: "field" }, h("label", null, "다운로드 방식"), mode),
       h("div", { class: "num-grid" },
@@ -690,7 +694,7 @@ async function downloadDialog(paths, info) {
     { label: "다운로드 시작", kind: "primary", onClick: async () => {
       const { separate, ...opts } = o;
       store.set("dlopts", o); store.set("dlSaveto", saveto.value.trim());
-      return POST("/api/tasks/download", { paths, separate, options: { ...opts, saveto: saveto.value.trim() } });
+      return POST("/api/tasks/download", { paths, separate, options: { ...opts, saveto: saveto.value.trim(), extract_password: pwInput.value } });
     } }] });
   if (res && res.ok) {
     toast(`${res.tasks.length}개 작업을 전송 현황에 추가했습니다.`, "ok");
@@ -786,12 +790,61 @@ PAGES.tasks = (view) => {
 
   // 요약 영역도 한 번만 만들고 숫자만 바꾼다
   const sumRunning = h("strong"), sumQueued = h("strong"), sumSpeed = h("strong"), sumRunningLabel = h("span");
+  // 전송 제어: 전체 일시정지, 속도 제한, 예약·자동 재시도 상태
+  const pauseBtn = h("button", { class: "btn", onclick: () => busy(pauseBtn, async () => {
+    if (xstate.paused) await POST("/api/tasks/resume_all");
+    else {
+      if (state.running && !await confirmBox("전체 일시정지", "진행 중인 작업을 멈추고 대기열로 돌립니다. 재개하면 받던 곳부터 이어받습니다.", { ok: "일시정지" })) return;
+      await POST("/api/tasks/pause_all");
+    }
+    tick();
+  }) });
+  const RATES = [["0", "속도 제한 없음"], ["500KB", "500 KB/s"], ["1MB", "1 MB/s"], ["2MB", "2 MB/s"], ["5MB", "5 MB/s"], ["10MB", "10 MB/s"], ["custom", "직접 입력…"]];
+  const rateSel = h("select", { class: "input", style: { width: "auto" }, onchange: async () => {
+    let v = rateSel.value;
+    if (v === "custom") { v = await promptBox("속도 제한", "초당 최대 속도", currentRate, { help: "예: 800KB, 3MB, 0 = 제한 없음" }); if (!v) { setRateSel(currentRate); return; } }
+    let restart = false;
+    if (state.running) restart = !!await confirmBox("속도 제한", "진행 중인 작업에도 바로 적용할까요?\n작업을 잠깐 멈췄다가 받던 곳부터 이어받습니다.\n‘취소’를 누르면 다음 작업부터 적용됩니다.", { ok: "바로 적용" });
+    try { const r = await api("PUT", "/api/tasks/speed", { rate: v, restart }); toast(`속도 제한: ${r.rate === "0" ? "없음" : r.rate + "/s"}` + (r.restarted ? ` (${r.restarted}개 작업에 적용)` : ""), "ok"); currentRate = r.rate; }
+    catch (e) { toast(e.message, "err"); }
+    setRateSel(currentRate); tick();
+  } }, RATES.map(([v, l]) => h("option", { value: v }, l)));
+  let currentRate = "0";
+  function setRateSel(r) {
+    if (!RATES.some(([v]) => v === r)) {
+      let o = rateSel.querySelector("option[data-cur]");
+      if (!o) { o = h("option", { "data-cur": "1" }); rateSel.insertBefore(o, rateSel.lastChild); }
+      o.value = r; o.textContent = `${r}/s`;
+    }
+    rateSel.value = r;
+  }
+  const chips = h("div", { class: "row", style: { gap: "6px" } });
+  let xstate = { paused: false, schedule: {}, auto_retry: {}, in_window: true };
+  const pausedNote = h("div", { class: "notice", hidden: true, style: { margin: "0 0 16px" } });
   summary.append(
     h("div", { class: "stat" }, sumRunning, sumRunningLabel),
     h("div", { class: "stat" }, sumQueued, h("span", null, "대기 중")),
     h("div", { class: "stat" }, sumSpeed, h("span", null, "현재 속도")),
     h("span", { class: "spacer" }),
-    h("button", { class: "btn", onclick: () => go("files") }, icon("download"), "넷디스크에서 받기"));
+    h("div", { class: "row" }, pauseBtn, rateSel,
+      h("button", { class: "btn", onclick: () => transferSettingsDialog(xstate).then(tick) }, icon("config"), "예약·재시도"),
+      h("button", { class: "btn", onclick: () => go("files") }, icon("download"), "넷디스크에서 받기")));
+  summary.after(h("div", { class: "task-chips" }, chips));
+  view.insertBefore(pausedNote, view.children[1]);
+  function renderControls(r) {
+    xstate = r.state;
+    pauseBtn.replaceChildren(icon(xstate.paused ? "play" : "stop"), xstate.paused ? "전체 재개" : "전체 일시정지");
+    pauseBtn.className = "btn" + (xstate.paused ? " primary" : "");
+    if (document.activeElement !== rateSel) { currentRate = r.rate || "0"; setRateSel(currentRate); }
+    const sc = xstate.schedule, ar = xstate.auto_retry;
+    chips.replaceChildren(
+      sc.enabled ? h("span", { class: `tag ${xstate.in_window ? "ok" : "warn"}` }, `예약 ${sc.start}–${sc.end}` + (xstate.in_window ? " · 받는 시간" : " · 지금은 대기")) : h("span", { class: "tag" }, "예약 없음 (항상 받기)"),
+      ar.enabled ? h("span", { class: "tag accent" }, `자동 재시도 ${ar.max}회 · ${ar.delay_min}분 간격`) : h("span", { class: "tag" }, "자동 재시도 꺼짐"),
+      currentRate !== "0" ? h("span", { class: "tag warn" }, `속도 제한 ${currentRate}/s`) : null);
+    pausedNote.hidden = !xstate.paused;
+    if (xstate.paused) pausedNote.replaceChildren(h("strong", null, "전체 일시정지 중입니다. "), "새 작업도 시작하지 않습니다. ",
+      h("button", { class: "linkish", onclick: () => pauseBtn.click() }, "재개하기"));
+  }
 
   const setText = (el, v) => { v = v == null ? "" : String(v); if (el.textContent !== v) el.textContent = v; };
   const setClass = (el, v) => { if (el.className !== v) el.className = v; };
@@ -836,14 +889,28 @@ PAGES.tasks = (view) => {
   }
 
   function renderActions(c, t) {
-    const running = ["queued", "running"].includes(t.status);
-    const key = running ? "run" : (t.status === "done" ? "done" : "retry");
+    const waitRetry = t.status === "failed" && t.meta && t.meta.retry_at;
+    const outOfWindow = xstate.schedule && xstate.schedule.enabled && !xstate.in_window && !(t.meta && t.meta.ignore_schedule);
+    const key = t.status === "queued" ? "queued" + (outOfWindow || xstate.paused ? "-held" : "")
+      : t.status === "running" ? "run" : waitRetry ? "wait" : (t.status === "done" ? "done" : "retry");
     if (c.actionsKey === key) return;
     c.actionsKey = key;
+    const act = (label, ic, fn, cls = "btn sm") => h("button", { class: cls, title: label, onclick: (e) => busy(e.currentTarget, async () => { await fn(); tick(); }) }, ic ? icon(ic) : null, ic && cls.includes("icon-btn") ? null : label);
+    const move = (where) => () => POST(`/api/tasks/${c.id}/move`, { where });
+    let main;
+    if (key.startsWith("queued")) {
+      main = [
+        key.endsWith("held") ? act("지금 받기", "play", () => POST(`/api/tasks/${c.id}/run_now`).then(() => xstate.paused && toast("전체 일시정지 중이라 재개해야 시작됩니다."))) : null,
+        act("맨 위로", null, move("top")),
+        act("위로", "up", move("up"), "icon-btn plain"),
+        h("button", { class: "icon-btn plain", title: "아래로", onclick: (e) => busy(e.currentTarget, async () => { await move("down")(); tick(); }) }, h("span", { class: "rot" }, icon("up"))),
+        act("취소", "stop", () => POST(`/api/tasks/${c.id}/stop`)),
+      ];
+    } else if (key === "run") main = [act("중지", "stop", () => POST(`/api/tasks/${c.id}/stop`))];
+    else if (key === "wait") main = [act("지금 재시도", "play", () => POST(`/api/tasks/${c.id}/retry`)), act("자동 재시도 취소", null, () => POST(`/api/tasks/${c.id}/stop`))];
+    else main = [act(key === "done" ? "다시 실행" : "이어받기", "play", () => POST(`/api/tasks/${c.id}/retry`))];
     c.actions.replaceChildren(
-      running
-        ? h("button", { class: "btn sm", onclick: (e) => busy(e.currentTarget, async () => { await POST(`/api/tasks/${c.id}/stop`); tick(); }) }, icon("stop"), "중지")
-        : h("button", { class: "btn sm", onclick: (e) => busy(e.currentTarget, async () => { await POST(`/api/tasks/${c.id}/retry`); tick(); }) }, icon("play"), key === "done" ? "다시 실행" : "이어받기"),
+      ...main,
       h("button", { class: "icon-btn plain", title: "로그", onclick: () => logDialog(c.id) }, icon("log")),
       h("button", { class: "icon-btn plain", title: "더 보기", onclick: (e) => {
         const t2 = c.t;   // 메뉴를 여는 시점의 최신 상태 사용
@@ -865,10 +932,10 @@ PAGES.tasks = (view) => {
   function fileRow(c, f) {
     let r = c.rows.get(f.id);
     if (!r) {
-      r = { name: h("span", { class: "n" }), sub: h("small"), fill: h("i"), stateEl: h("div", { class: "r" }) };
+      r = { name: h("span", { class: "n" }), sub: h("small"), fill: h("i"), stateEl: h("div", { class: "r" }), dl: h("a", { class: "linkish pc-dl", hidden: true, title: "이 파일을 PC 로 받기" }, "PC로 받기") };
       r.mini = h("div", { class: "mini" }, r.fill);
       r.p = h("div", { class: "p" }, r.name, r.sub);
-      r.el = h("div", { class: "tfile" }, r.p, r.mini, r.stateEl);
+      r.el = h("div", { class: "tfile" }, r.p, r.mini, h("div", { class: "r-wrap" }, r.stateEl, r.dl));
       r.el.dataset.fid = f.id;
       c.rows.set(f.id, r);
     }
@@ -883,6 +950,9 @@ PAGES.tasks = (view) => {
       + (f.state === "running" && f.speed ? ` · ${fmtSize(f.speed)}/s` : "")
       + (f.total ? ` · ${fmtSize(f.total)}` : ""));
     setClass(r.el, `tfile ${f.state === "running" ? "active" : ""} ${f.state === "failed" ? "bad" : ""}`.trim());
+    const canDl = (f.state === "done" || f.state === "skipped") && f.save_path && c.t && ["download", "relay", "transfer"].includes(c.t.kind);
+    r.dl.hidden = !canDl;
+    if (canDl) { const href = "/api/local/file?" + qs({ path: f.save_path }); if (r.dl.getAttribute("href") !== href) r.dl.setAttribute("href", href); }
     return r;
   }
 
@@ -923,9 +993,13 @@ PAGES.tasks = (view) => {
     const acct = t.meta && t.meta.account;
     c.acctTag.hidden = !acct || !state.info || state.info.accounts.length < 2;
     if (acct) { setText(c.acctTag, acct); c.acctTag.title = "이 작업은 이 계정으로 실행됩니다"; }
-    const showPhase = !!t.phase && ["running", "failed", "stopped", "interrupted"].includes(t.status);
+    const retryAt = t.status === "failed" && t.meta && t.meta.retry_at;
+    const showPhase = !!retryAt || (!!t.phase && ["running", "failed", "stopped", "interrupted"].includes(t.status));
     c.phase.hidden = !showPhase;
-    if (showPhase) setText(c.phase, (t.status === "running" ? "" : "멈춘 단계: ") + t.phase);
+    if (retryAt) {
+      const left = Math.max(0, retryAt - Date.now() / 1000);
+      setText(c.phase, `${left < 60 ? "곧" : Math.ceil(left / 60) + "분 뒤"} 자동으로 이어받습니다 (${t.meta.retry_count}/${xstate.auto_retry.max || "?"})` + (t.phase ? ` · 멈춘 단계: ${t.phase}` : ""));
+    } else if (showPhase) setText(c.phase, (t.status === "running" ? "" : "멈춘 단계: ") + t.phase);
     setText(c.title, t.title); if (c.title.title !== t.title) c.title.title = t.title;
     renderActions(c, t);
     setClass(c.lane, `lane ${t.status}`); setWidth(c.laneFill, pct);
@@ -934,7 +1008,7 @@ PAGES.tasks = (view) => {
       t.status === "running" && t.speed ? `${fmtSize(t.speed)}/s` : "",
       remaining ? `남은 시간 ${remaining}` : "",
       t.count ? `파일 ${t.count_done}/${t.count}` : "",
-      `시작 ${fmtTime(t.started_at || t.created_at)}`,
+      t.started_at ? `시작 ${fmtTime(t.started_at)}` : `추가 ${fmtTime(t.created_at)}`,
       t.finished_at && t.started_at ? `소요 ${fmtDur(t.finished_at - t.started_at)}` : "",
       t.summary || "",
     ].filter(Boolean);
@@ -985,6 +1059,7 @@ PAGES.tasks = (view) => {
       const r = await GET("/api/tasks");
       trackTaskStatus(r.tasks);
       if (r.running !== state.running) { state.running = r.running; renderNav("tasks"); }
+      renderControls(r);
       render(r.tasks);
     } catch { /* 무시 */ }
   }
@@ -994,6 +1069,27 @@ PAGES.tasks = (view) => {
   tick();
   state.timers.push(setInterval(tick, 1500));
 };
+
+async function transferSettingsDialog(st) {
+  const ar = { ...st.auto_retry }, sc = { ...st.schedule };
+  const num = (obj, k, min, max) => h("input", { class: "input", type: "number", min, max, value: obj[k], oninput: (e) => { obj[k] = parseInt(e.target.value || "0", 10); } });
+  const time_ = (k) => h("input", { class: "input", type: "time", value: sc[k], oninput: (e) => { sc[k] = e.target.value; } });
+  const sw = (obj, k, label, sub) => h("label", { class: "check" }, h("input", { type: "checkbox", checked: !!obj[k], onchange: (e) => { obj[k] = e.target.checked; } }), h("span", null, label, sub && h("small", null, sub)));
+  const r = await modal({ title: "예약·자동 재시도", body: [
+    h("h4", { class: "dlg-sub" }, "시간대 예약"),
+    sw(sc, "enabled", "정해진 시간에만 받기", "시간대가 끝나면 진행 중인 작업을 멈추고, 다음 시간대에 받던 곳부터 이어받습니다."),
+    h("div", { class: "num-grid", style: { marginTop: "10px" } },
+      h("div", { class: "field" }, h("label", null, "시작"), time_("start")),
+      h("div", { class: "field" }, h("label", null, "끝"), time_("end"))),
+    h("p", { class: "help", style: { marginTop: 0 } }, "자정을 넘겨도 됩니다 (예: 01:00 ~ 07:00, 23:00 ~ 06:00). 작업 카드의 ‘지금 받기’로 예외를 둘 수 있습니다."),
+    h("h4", { class: "dlg-sub" }, "자동 재시도"),
+    sw(ar, "enabled", "실패한 작업을 자동으로 이어받기", "바이두 속도 제한·네트워크 오류로 실패했을 때. 계정·공간 문제처럼 다시 해도 같은 실패는 재시도하지 않습니다."),
+    h("div", { class: "num-grid", style: { marginTop: "10px" } },
+      h("div", { class: "field" }, h("label", null, "최대 횟수"), num(ar, "max", 1, 20)),
+      h("div", { class: "field" }, h("label", null, "간격 (분)"), num(ar, "delay_min", 1, 1440))),
+  ], actions: [{ label: "취소" }, { label: "저장", kind: "primary", onClick: () => api("PUT", "/api/tasks/settings", { auto_retry: ar, schedule: sc }) }] });
+  if (r) toast("저장했습니다.", "ok");
+}
 
 function openLocal(abs) {
   const info = state.info;
@@ -1324,6 +1420,10 @@ PAGES.offline = (view, params) => {
   if (!requireLogin(view)) return;
   const urls = h("textarea", { class: "input", rows: 5, placeholder: "한 줄에 하나씩\nhttp/https/ftp 주소, 磁力(magnet:?xt=...), ed2k:// 링크" });
   const path = h("input", { class: "input", value: params.get("path") || store.get("offlinePath", "/") });
+  const autoDl = h("input", { type: "checkbox", checked: store.get("offlineAuto", true) });
+  const offSaveto = h("input", { class: "input", value: store.get("dlSaveto", state.info.download_dir) });
+  const dlOpts = () => { const o = { ...DL_DEFAULTS, ...store.get("dlopts", {}) }; delete o.separate; return o; };
+  let watch = {};
   const addOut = h("pre", { class: "output wrap", hidden: true });
   const listEl = h("div");
   const selected = new Set();
@@ -1331,8 +1431,9 @@ PAGES.offline = (view, params) => {
   const addBtn = h("button", { class: "btn primary", onclick: () => busy(addBtn, async () => {
     const list = urls.value.split(/\n+/).map((s) => s.trim()).filter(Boolean);
     if (!list.length) return toast("주소를 입력하세요.", "err");
-    store.set("offlinePath", path.value.trim());
-    const r = await POST("/api/offline/add", { path: path.value.trim() || "/", urls: list });
+    store.set("offlinePath", path.value.trim()); store.set("offlineAuto", autoDl.checked);
+    const r = await POST("/api/offline/add", { path: path.value.trim() || "/", urls: list,
+      auto_download: autoDl.checked, saveto: offSaveto.value.trim(), options: dlOpts() });
     addOut.hidden = false; addOut.textContent = r.output;
     if (r.ok) { urls.value = ""; toast("오프라인 작업을 추가했습니다.", "ok"); }
     load();
@@ -1350,6 +1451,7 @@ PAGES.offline = (view, params) => {
   async function load(cached) {
     if (!cached || !lastR) listEl.replaceChildren(h("div", { class: "loading" }, "목록을 불러오는 중"));
     const r = cached && lastR ? lastR : (lastR = await GET("/api/offline/list"));
+    watch = r.watch || {};
     if (!r.items.length) {
       listEl.replaceChildren(r.output && !/任务ID/.test(r.output) && r.output.trim() ? h("pre", { class: "output wrap", style: { margin: "14px" } }, r.output) :
         h("div", { class: "empty" }, h("h3", null, "오프라인 작업이 없습니다"), h("p", null, "바이두 서버가 대신 받아 넷디스크에 저장합니다. 동시에 진행할 수 있는 작업 수에 제한이 있습니다.")));
@@ -1367,11 +1469,16 @@ PAGES.offline = (view, params) => {
         h("td", null, h("div", { class: "fname" }, h("div", { style: { minWidth: 0 } }, h("span", { class: "n", style: { fontWeight: 500 } }, t.name || "(이름 없음)"),
           h("span", { class: "sub" }, `#${t.task_id} · ${t.save_path} · ${t.url}`)))),
         h("td", { class: "c-size" }, t.size_text),
-        h("td", null, h("span", { class: `tag ${t.tone}` }, t.status_label)),
+        h("td", null, h("span", { class: `tag ${t.tone}` }, t.status_label),
+          watch[t.task_id] ? h("span", { class: "tag accent", style: { marginLeft: "6px" }, title: "완료되면 " + watch[t.task_id].saveto + " 로 받습니다" }, "NAS로 받기 예약") : null),
         h("td", { class: "c-time" }, t.created),
         h("td", { class: "c-act" }, h("button", { class: "icon-btn plain", title: "더 보기", onclick: (e) => popMenu(e.currentTarget, [
           { label: "넷디스크에서 열기", onClick: () => go("files", { path: t.save_path }) },
           { label: "NAS 로 다운로드", onClick: () => downloadDialog([t.save_path + "/" + t.name]) },
+          watch[t.task_id]
+            ? { label: "자동 받기 예약 취소", onClick: async () => { await POST("/api/offline/unwatch", { ids: [t.task_id] }); toast("예약을 취소했습니다."); load(); } }
+            : (t.status === "下载进行中" ? { label: "완료되면 NAS 로 받기", onClick: async () => {
+              await POST("/api/offline/watch", { ids: [t.task_id], saveto: offSaveto.value.trim(), options: dlOpts() }); toast("완료되면 NAS 로 받도록 예약했습니다.", "ok"); load(); } } : null),
           { label: "상세 조회", onClick: () => act("query", [t.task_id]) },
           { label: "주소 복사", onClick: () => copyText(t.url) },
           "-",
@@ -1386,9 +1493,15 @@ PAGES.offline = (view, params) => {
         h("div", { class: "field" }, h("label", null, "주소"), urls),
         h("div", { class: "field" }, h("label", null, "저장할 넷디스크 폴더"), h("div", { class: "input-row" }, path,
           h("button", { class: "btn", onclick: async () => { const p = await pickRemoteFolder(path.value); if (p) path.value = p; } }, "찾아보기"))),
+        h("label", { class: "check", style: { marginBottom: "10px" } }, autoDl,
+          h("span", null, "완료되면 NAS 로 받기", h("small", null, "바이두 서버에서 받기가 끝나면 자동으로 NAS 다운로드 작업을 만듭니다 (1분마다 확인). 압축 풀기 등은 마지막 다운로드 설정을 따릅니다."))),
+        h("div", { class: "field" }, h("label", null, "NAS 저장 위치"), h("div", { class: "input-row" }, offSaveto,
+          h("button", { class: "btn", onclick: async () => { const p = await pickLocalFolder(offSaveto.value); if (p) offSaveto.value = p; } }, "찾아보기"))),
         addBtn, addOut))),
   h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", null, "작업 목록"), h("span", { class: "spacer" }),
     h("button", { class: "btn sm", onclick: () => load() }, icon("refresh"), "새로고침"),
+    h("button", { class: "btn sm", title: "예약된 작업이 끝났는지 지금 확인", onclick: (e) => busy(e.currentTarget, async () => {
+      const r = await POST("/api/offline/check"); toast(r.created ? `${r.created}개를 NAS 다운로드 작업으로 넘겼습니다.` : "새로 끝난 작업이 없습니다.", r.created ? "ok" : ""); load(); }) }, "완료 확인"),
     h("button", { class: "btn sm danger", onclick: () => act("delete", [], true) }, "기록 모두 지우기")), listEl));
   load();
   state.timers.push(setInterval(() => { if (!$(".menu") && !$(".modal-back")) load(); }, 20000));

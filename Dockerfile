@@ -21,7 +21,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     WEB_PORT=8777
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl unzip tzdata \
+ && apt-get install -y --no-install-recommends ca-certificates curl unzip tzdata unar \
  && rm -rf /var/lib/apt/lists/*
 
 # 동봉된 바이너리(bin/)를 우선 사용하고, 없는 아키텍처면 GitHub 릴리즈에서 받는다.

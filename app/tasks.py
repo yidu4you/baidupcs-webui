@@ -21,6 +21,12 @@ from typing import Any
 from . import notify, pcs, settings
 
 STORE = os.path.join(settings.WEBUI_DIR, "tasks.json")
+STATE_STORE = os.path.join(settings.WEBUI_DIR, "transfer_state.json")
+DEFAULT_STATE = {
+    "paused": False,
+    "auto_retry": {"enabled": True, "max": 3, "delay_min": 10},
+    "schedule": {"enabled": False, "start": "01:00", "end": "07:00"},
+}
 LOG_LINES = 400
 
 RE_PROGRESS = re.compile(r"\[(\d+)\]\s*([↓↑])\s*(\S+)/(\S+)\s+(\S+)/s\s+in\s+(\S+?)(?:,\s*left\s+(\S+))?\s*\.*$")
@@ -59,10 +65,13 @@ class Task:
         self.files: dict[str, dict] = {}
         self.log: deque[str] = deque(maxlen=LOG_LINES)
         self.phase = ""             # 여러 단계 작업(경유 모드)의 현재 단계 설명
+        self.order = self.created_at  # 대기열 순서 (작을수록 먼저)
+        self._hold = ""             # 일시정지·예약·속도변경으로 멈춘 경우 다시 대기열로 돌림
         self.proc: asyncio.subprocess.Process | None = None
         self._stop_requested = False
         self._in_failed_list = False
         self._disk_full = False
+        self._task_error = False    # 다시 해도 같은 결과인 실패 (자동 재시도 안 함)
 
     # ------------------------------------------------------------ 직렬화
     def to_dict(self, with_log: bool = False) -> dict:
@@ -74,7 +83,7 @@ class Task:
             "id": self.id, "kind": self.kind, "title": self.title, "args": self.args, "meta": self.meta,
             "status": self.status, "created_at": self.created_at, "started_at": self.started_at,
             "finished_at": self.finished_at, "returncode": self.returncode,
-            "summary": self.summary, "error": self.error, "files": files, "phase": self.phase,
+            "summary": self.summary, "error": self.error, "files": files, "phase": self.phase, "order": self.order,
             "total": total, "done": done, "speed": speed,
             "count": len(files), "count_done": sum(1 for f in files if f["state"] in ("done", "skipped")),
         }
@@ -93,6 +102,7 @@ class Task:
         for k in ("status", "created_at", "started_at", "finished_at", "returncode", "summary", "error", "phase"):
             setattr(t, k, d.get(k))
         t.phase = t.phase or ""
+        t.order = d.get("order") or t.created_at
         t.files = {f["id"]: f for f in d.get("files", [])}
         t.log.extend(d.get("log", []))
         if t.status in ("running", "queued"):
@@ -204,12 +214,31 @@ class Task:
                     f["state"] = "failed"
 
 
+def _hm(v: str) -> int:
+    try:
+        h, m = str(v).split(":")
+        return (int(h) % 24) * 60 + int(m) % 60
+    except (ValueError, AttributeError):
+        return 0
+
+
 class TaskManager:
     def __init__(self):
         self.tasks: dict[str, Task] = {}
         self._wakeup = asyncio.Event()
         self._last_save = 0.0
         self._runner: asyncio.Task | None = None
+        self.state = json.loads(json.dumps(DEFAULT_STATE))
+        try:
+            with open(STATE_STORE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            for k, v in saved.items():
+                if isinstance(v, dict) and isinstance(self.state.get(k), dict):
+                    self.state[k].update(v)
+                else:
+                    self.state[k] = v
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
         self._load()
 
     # ------------------------------------------------------------ 저장
@@ -238,7 +267,14 @@ class TaskManager:
             self._runner = asyncio.create_task(self._scheduler())
 
     def list(self) -> list[dict]:
-        return [t.to_dict() for t in sorted(self.tasks.values(), key=lambda t: t.created_at, reverse=True)]
+        """진행 중 → 대기 중(실행 순서대로) → 나머지(최근 것부터) 순서."""
+        def key(t):
+            if t.status == "running":
+                return (0, -(t.started_at or 0))
+            if t.status == "queued":
+                return (1, t.order)
+            return (2, -t.created_at)
+        return [t.to_dict() for t in sorted(self.tasks.values(), key=key)]
 
     def get(self, tid: str) -> Task | None:
         return self.tasks.get(tid)
@@ -250,32 +286,132 @@ class TaskManager:
         self._wakeup.set()
         return t
 
-    async def stop(self, tid: str) -> bool:
+    # ------------------------------------------------------------ 전송 설정
+    def save_state(self):
+        tmp = STATE_STORE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.state, f, ensure_ascii=False)
+        os.replace(tmp, STATE_STORE)
+
+    def update_state(self, values: dict) -> dict:
+        ar, sc = values.get("auto_retry"), values.get("schedule")
+        if isinstance(ar, dict):
+            self.state["auto_retry"].update({
+                "enabled": bool(ar.get("enabled", self.state["auto_retry"]["enabled"])),
+                "max": max(1, min(20, int(ar.get("max", self.state["auto_retry"]["max"])))),
+                "delay_min": max(1, min(1440, int(ar.get("delay_min", self.state["auto_retry"]["delay_min"])))),
+            })
+        if isinstance(sc, dict):
+            self.state["schedule"].update({
+                "enabled": bool(sc.get("enabled", self.state["schedule"]["enabled"])),
+                "start": str(sc.get("start", self.state["schedule"]["start"]))[:5],
+                "end": str(sc.get("end", self.state["schedule"]["end"]))[:5],
+            })
+        self.save_state()
+        self._wakeup.set()
+        return self.public_state()
+
+    def in_window(self) -> bool:
+        sc = self.state["schedule"]
+        if not sc["enabled"]:
+            return True
+        lt = time.localtime()
+        cur = lt.tm_hour * 60 + lt.tm_min
+        a, b = _hm(sc["start"]), _hm(sc["end"])
+        if a == b:
+            return True
+        return a <= cur < b if a < b else (cur >= a or cur < b)
+
+    def public_state(self) -> dict:
+        return {**self.state, "in_window": self.in_window()}
+
+    async def pause_all(self):
+        self.state["paused"] = True
+        self.save_state()
+        for t in list(self.tasks.values()):
+            if t.status == "running":
+                await self.stop(t.id, hold="pause")
+
+    def resume_all(self):
+        self.state["paused"] = False
+        self.save_state()
+        self._wakeup.set()
+
+    async def restart_running(self, kinds=("download", "relay", "transfer")) -> int:
+        """진행 중인 작업을 잠깐 멈췄다가 다시 대기열 맨 앞으로 (설정 변경을 바로 적용할 때)."""
+        n = 0
+        for t in list(self.tasks.values()):
+            if t.status == "running" and t.kind in kinds:
+                await self.stop(t.id, hold="restart")
+                n += 1
+        return n
+
+    def move(self, tid: str, where: str) -> bool:
+        q = sorted((t for t in self.tasks.values() if t.status == "queued"), key=lambda t: t.order)
+        t = self.tasks.get(tid)
+        if not t or t not in q:
+            return False
+        i = q.index(t)
+        if where == "top":
+            t.order = (q[0].order - 1) if q else t.order
+        elif where == "bottom":
+            t.order = q[-1].order + 1
+        elif where == "up" and i > 0:
+            t.order, q[i - 1].order = q[i - 1].order, t.order
+        elif where == "down" and i < len(q) - 1:
+            t.order, q[i + 1].order = q[i + 1].order, t.order
+        self.save(force=True)
+        return True
+
+    def run_now(self, tid: str) -> bool:
+        """예약 시간대와 관계없이 이 작업을 바로 시작."""
+        t = self.tasks.get(tid)
+        if not t or t.status != "queued":
+            return False
+        t.meta["ignore_schedule"] = True
+        t.order = min([x.order for x in self.tasks.values() if x.status == "queued"] + [t.order]) - 1
+        self.save(force=True)
+        self._wakeup.set()
+        return True
+
+    async def stop(self, tid: str, hold: str = "") -> bool:
         t = self.tasks.get(tid)
         if not t:
             return False
         if t.status == "queued":
+            if hold:
+                return True
             t.status = "stopped"
             t.finished_at = now()
             self.save(force=True)
             return True
-        if t.status == "running" and t.proc and t.proc.returncode is None:
+        if t.status == "running":
             t._stop_requested = True
-            try:
-                t.proc.send_signal(signal.SIGINT)
-            except ProcessLookupError:
-                pass
-            try:
-                await asyncio.wait_for(t.proc.wait(), 5)
-            except asyncio.TimeoutError:
-                t.proc.kill()
+            t._hold = hold
+            if t.proc and t.proc.returncode is None:
+                try:
+                    t.proc.send_signal(signal.SIGINT)
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.wait_for(t.proc.wait(), 5)
+                except asyncio.TimeoutError:
+                    t.proc.kill()
+            return True
+        if t.status == "failed" and t.meta.get("retry_at"):
+            # 자동 재시도 대기 중인 작업을 멈추면 재시도 예약도 취소
+            t.meta.pop("retry_at", None)
+            self.save(force=True)
             return True
         return False
 
-    def retry(self, tid: str) -> bool:
+    def retry(self, tid: str, auto: bool = False) -> bool:
         t = self.tasks.get(tid)
         if not t or t.status in ("running", "queued"):
             return False
+        t.meta.pop("retry_at", None)
+        if not auto:
+            t.meta["retry_count"] = 0
         if t.kind == "relay" and t.status == "done":
             # 끝난 공유 링크 작업을 ‘다시 실행’ 하면 처음(링크 저장)부터 다시 한다
             for k in ("items", "item_info", "size"):
@@ -291,13 +427,15 @@ class TaskManager:
         t._stop_requested = False
         t._in_failed_list = False
         t._disk_full = False
+        t._task_error = False
+        t._hold = ""
         t.phase = ""
         for f in t.files.values():
             if f["state"] not in ("done", "skipped"):
                 f["state"] = "queued"
                 f["speed"] = 0
                 f["message"] = ""
-        t.log.append("---- 다시 시작 ----")
+        t.log.append("---- 자동 재시도 ----" if auto else "---- 다시 시작 ----")
         self.save(force=True)
         self._wakeup.set()
         return True
@@ -326,14 +464,29 @@ class TaskManager:
     async def _scheduler(self):
         while True:
             try:
-                queued = sorted((t for t in self.tasks.values() if t.status == "queued"), key=lambda t: t.created_at)
-                free = settings.MAX_CONCURRENT_TASKS - self.running_count()
-                for t in queued[:max(0, free)]:
-                    t.status = "running"
-                    asyncio.create_task(self._run(t))
+                in_window = self.in_window()
+                sched_on = self.state["schedule"]["enabled"]
+                # 예약 시간대가 끝나면 진행 중인 작업을 멈추고 대기열로 돌린다
+                if sched_on and not in_window:
+                    for t in list(self.tasks.values()):
+                        if t.status == "running" and not t.meta.get("ignore_schedule") and not t._hold:
+                            asyncio.create_task(self.stop(t.id, hold="schedule"))
+                # 자동 재시도 시각이 된 작업
+                for t in list(self.tasks.values()):
+                    ra = t.meta.get("retry_at")
+                    if t.status == "failed" and ra and ra <= now():
+                        self.retry(t.id, auto=True)
+                if not self.state["paused"]:
+                    queued = sorted((t for t in self.tasks.values() if t.status == "queued"), key=lambda t: t.order)
+                    if sched_on and not in_window:
+                        queued = [t for t in queued if t.meta.get("ignore_schedule")]
+                    free = settings.MAX_CONCURRENT_TASKS - self.running_count()
+                    for t in queued[:max(0, free)]:
+                        t.status = "running"
+                        asyncio.create_task(self._run(t))
                 self._wakeup.clear()
                 try:
-                    await asyncio.wait_for(self._wakeup.wait(), 2)
+                    await asyncio.wait_for(self._wakeup.wait(), 5)
                 except asyncio.TimeoutError:
                     pass
             except Exception as e:  # 스케줄러가 죽지 않도록
@@ -457,9 +610,13 @@ class TaskManager:
                     await self._exec(t, ["cd", t.meta["pre_cd"]], env, feed=False)
                 watch = t.meta.get("saveto") if t.kind in ("download", "transfer") else None
                 t.returncode, _ = await self._exec(t, t.args, env, watch_dir=watch)
+            if (t.meta.get("extract") and not t._stop_requested and t.returncode == 0
+                    and not any(f["state"] == "failed" for f in t.files.values())):
+                await self._extract(t)
         except TaskError as e:
             t.error = str(e)
             t.returncode = -1
+            t._task_error = True
         except Exception as e:
             t.error = f"{type(e).__name__}: {e}"
             t.returncode = -1
@@ -468,6 +625,12 @@ class TaskManager:
             t.proc = None
             for f in t.files.values():
                 f["speed"] = 0
+            # 멈추라고 했지만 그 사이 정상적으로 끝났다면 완료로 처리한다
+            finished_anyway = (t._stop_requested and t.returncode == 0 and t.kind != "relay" and t.files
+                               and all(f["state"] in ("done", "skipped") for f in t.files.values()))
+            if finished_anyway:
+                t._stop_requested = False
+                t._hold = ""
             if t._stop_requested and not t._disk_full:
                 t.status = "stopped"
                 for f in t.files.values():
@@ -491,12 +654,40 @@ class TaskManager:
                     t.error = _last_meaningful(t.log)
             if t.status == "done":
                 t.phase = ""
+            if t.status == "stopped" and t._hold:
+                reason = {"pause": "전체 일시정지", "schedule": "예약 시간대 종료", "restart": "설정 적용"}.get(t._hold, t._hold)
+                t.log.append(f"---- {reason}로 멈춤, 대기열로 돌아감 ----")
+                t._hold = ""
+                t._stop_requested = False
+                t.status = "queued"
+                t.summary = ""
+                t.started_at = t.finished_at = None
+                for f in t.files.values():
+                    if f["state"] == "stopped":
+                        f["state"] = "queued"
+            retry_scheduled = False
+            ar = self.state["auto_retry"]
+            if t.status == "failed" and ar["enabled"] and not t._task_error and not t._disk_full:
+                cnt = int(t.meta.get("retry_count") or 0)
+                if cnt < ar["max"]:
+                    t.meta["retry_count"] = cnt + 1
+                    t.meta["retry_at"] = now() + ar["delay_min"] * 60
+                    t.log.append(f"{ar['delay_min']}분 뒤 자동으로 이어받습니다 ({cnt + 1}/{ar['max']})")
+                    retry_scheduled = True
             if run_dir:
                 shutil.rmtree(run_dir, ignore_errors=True)
             self.save(force=True)
             self._wakeup.set()
-            if t.status in ("done", "failed"):
+            if t.status == "done" or (t.status == "failed" and not retry_scheduled):
                 asyncio.create_task(notify.notify_task(t))
+
+    async def _extract(self, t: Task):
+        self.save(force=True)
+        try:
+            await _extract_impl(t)
+        except Exception as e:
+            t.log.append(f"압축 해제 중 오류: {e}")
+        self.save(force=True)
 
     async def _run_relay(self, t: Task, env: dict):
         """공유 링크 → 넷디스크 저장 → NAS 다운로드 → (경유 모드면) 넷디스크·휴지통에서 삭제.
@@ -580,6 +771,8 @@ class TaskManager:
                 if not t.returncode:
                     t.returncode = 1
                 return
+            if m.get("extract"):
+                await self._extract(t)
             m["stage"] = "cleanup" if relay else "done"
             self.save(force=True)
 
@@ -611,13 +804,89 @@ class TaskManager:
             t.returncode = 0
 
 
+ARCHIVE_RE = re.compile(r"\.(zip|7z|rar|tar|tgz|tar\.gz|tar\.bz2|tar\.xz)$|\.7z\.0*1$|\.zip\.0*1$", re.I)
+PART_RAR_RE = re.compile(r"\.part0*(\d+)\.rar$", re.I)
+
+
+def _is_first_volume(name: str) -> bool:
+    if not ARCHIVE_RE.search(name):
+        return False
+    m = PART_RAR_RE.search(name)
+    return int(m.group(1)) == 1 if m else True
+
+
+def _volumes(path: str) -> list[str]:
+    """압축 파일과 같은 묶음의 분할 파일들."""
+    d, name = os.path.split(path)
+    low = name.lower()
+    if PART_RAR_RE.search(low):
+        stem = PART_RAR_RE.sub("", name)
+        pat = re.compile(re.escape(stem) + r"\.part\d+\.rar$", re.I)
+    elif re.search(r"\.(7z|zip)\.0*1$", low):
+        stem = re.sub(r"\.0*1$", "", name)
+        pat = re.compile(re.escape(stem) + r"\.\d+$", re.I)
+    elif low.endswith(".rar"):
+        stem = name[:-4]
+        pat = re.compile(re.escape(stem) + r"\.(rar|r\d\d)$", re.I)
+    elif low.endswith(".zip"):
+        stem = name[:-4]
+        pat = re.compile(re.escape(stem) + r"\.(zip|z\d\d)$", re.I)
+    else:
+        return [path]
+    try:
+        return [os.path.join(d, f) for f in os.listdir(d) if pat.match(f)]
+    except OSError:
+        return [path]
+
+
+async def _extract_impl(t: "Task") -> None:
+    files = [f["save_path"] for f in t.files.values()
+             if f["state"] in ("done", "skipped") and f.get("save_path")]
+    archives = sorted({p for p in files if os.path.isfile(p) and _is_first_volume(os.path.basename(p))})
+    if not archives:
+        t.log.append("압축 해제: 압축 파일이 없습니다.")
+        return
+    ok = bad = 0
+    for i, arc in enumerate(archives, 1):
+        t.phase = f"압축 해제 중 ({i}/{len(archives)}) {os.path.basename(arc)}"
+        args = ["unar", "-q", "-f", "-o", os.path.dirname(arc)]
+        if t.meta.get("extract_password"):
+            args += ["-p", t.meta["extract_password"]]
+        args.append(arc)
+        try:
+            proc = await asyncio.create_subprocess_exec(*args, stdin=asyncio.subprocess.DEVNULL,
+                                                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            out, _ = await proc.communicate()
+            rc = proc.returncode
+        except FileNotFoundError:
+            t.log.append("압축 해제 도구(unar)가 없습니다. 이미지를 다시 빌드하세요.")
+            return
+        text = out.decode("utf-8", "replace").strip()
+        if rc == 0:
+            ok += 1
+            t.log.append(f"압축 해제 완료: {os.path.basename(arc)}")
+            if t.meta.get("extract_delete"):
+                for v in _volumes(arc):
+                    try:
+                        os.remove(v)
+                    except OSError:
+                        pass
+                t.log.append("  압축 파일 삭제")
+        else:
+            bad += 1
+            t.log.append(f"압축 해제 실패: {os.path.basename(arc)} — {text[-300:]}")
+    t.summary = (t.summary + " · " if t.summary else "") + f"압축 해제 {ok}개" + (f", 실패 {bad}개 (로그 확인)" if bad else "")
+    t.phase = ""
+
+
 class TaskError(Exception):
     """사용자에게 그대로 보여줄 작업 실패 사유."""
 
 
 def _last_meaningful(log) -> str:
     for line in reversed(log):
-        if line and not line.startswith("$") and not line.startswith("[0]"):
+        if (line and not line.startswith(("$", "[0]", "/", "----")) and "以下文件" not in line
+                and not line.startswith(("계정:", "필요한 공간"))):
             return line[:300]
     return "출력 없이 종료되었습니다."
 

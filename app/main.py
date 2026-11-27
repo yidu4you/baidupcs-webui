@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import re
 import json
 import os
 import secrets
@@ -17,7 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import notify, pcs, settings
+from . import notify, offline, pcs, settings
 from .tasks import manager
 from .terminal import terminal_session
 
@@ -51,6 +52,7 @@ async def _bootstrap():
 async def lifespan(app: FastAPI):
     await _bootstrap()
     manager.start()
+    offline.start()
     yield
     manager.save(force=True)
 
@@ -431,6 +433,10 @@ class DownloadOptions(BaseModel):
     test: bool = False
     dindex: int = 0
     exec_perm: bool = False
+    # 완료 후 처리 (BaiduPCS-Go 옵션이 아니라 이 웹 UI 가 처리)
+    extract: bool = False
+    extract_delete: bool = False
+    extract_password: str = ""
 
 
 class TransferBody(BaseModel):
@@ -463,6 +469,7 @@ async def transfer(body: TransferBody):
             **acct, "link": link, "code": code, "collect": body.collect, "rname": body.rname,
             "fs_id": body.fs_id.strip(), "saveto": saveto, "dl_flags": _download_flags(o),
             "delete_after": mode == "relay", "purge_recycle": body.purge_recycle, "stage": "transfer",
+            **_extract_meta(o),
         }
         label = "공유 링크" + (f" ({code})" if code else "")
         t = manager.add("relay", label, [], meta)
@@ -531,18 +538,59 @@ async def share_cancel(body: IdsBody):
 class OfflineAddBody(BaseModel):
     path: str = "/"
     urls: list[str]
+    auto_download: bool = False     # 완료되면 NAS 로 받기
+    saveto: str = ""
+    options: DownloadOptions | None = None
+
+
+async def _watch_info(saveto: str, o: DownloadOptions | None) -> dict:
+    o = o or DownloadOptions()
+    real = _resolve_local(None, None, saveto or settings.DOWNLOAD_DIR)
+    return {**(await _account_meta()), "saveto": real, "dl_flags": _download_flags(o), **_extract_meta(o)}
 
 
 @app.post("/api/offline/add")
 async def offline_add(body: OfflineAddBody):
+    info = await _watch_info(body.saveto, body.options) if body.auto_download else None
     rc, out = await pcs.run(["offlinedl", "add", f"--path={_abs(body.path)}", *_clean_paths(body.urls)])
-    return {"ok": not _looks_failed(out), "output": out}
+    ids = re.findall(r"任务ID\(task_id\):\s*(\d+)", out)
+    if info:
+        for tid in ids:
+            offline.add(tid, info)
+    msg = out + (f"\n\n완료되면 NAS 로 받도록 {len(ids)}개 작업을 예약했습니다." if info and ids else "")
+    return {"ok": bool(ids) or not _looks_failed(out), "output": msg, "task_ids": ids}
 
 
 @app.get("/api/offline/list")
 async def offline_list():
     rc, out = await pcs.run(["offlinedl", "list"])
-    return _ok(rc, out, items=pcs.parse_offline_list(out))
+    return _ok(rc, out, items=pcs.parse_offline_list(out), watch=offline.watched())
+
+
+class OfflineWatchBody(BaseModel):
+    ids: list[str]
+    saveto: str = ""
+    options: DownloadOptions | None = None
+
+
+@app.post("/api/offline/watch")
+async def offline_watch(body: OfflineWatchBody):
+    info = await _watch_info(body.saveto, body.options)
+    for tid in _clean_paths(body.ids):
+        offline.add(tid, info)
+    return {"ok": True, "watch": offline.watched()}
+
+
+@app.post("/api/offline/unwatch")
+async def offline_unwatch(body: IdsBody):
+    for tid in body.ids:
+        offline.remove(tid)
+    return {"ok": True, "watch": offline.watched()}
+
+
+@app.post("/api/offline/check")
+async def offline_check():
+    return {"created": await offline.check_once(), "watch": offline.watched()}
 
 
 @app.post("/api/offline/{action}")
@@ -607,6 +655,12 @@ async def _account_meta() -> dict:
     return {"uid": cur["uid"], "account": cur["name"] or cur["uid"]}
 
 
+def _extract_meta(o: DownloadOptions) -> dict:
+    if not o.extract:
+        return {}
+    return {"extract": True, "extract_delete": o.extract_delete, "extract_password": o.extract_password.strip()}
+
+
 def _download_flags(o: DownloadOptions) -> list[str]:
     flags = [f"--mode={o.mode}", f"--retry={o.retry}"]
     if o.overwrite:
@@ -644,7 +698,7 @@ async def task_download(body: DownloadBody):
         title = g[0].rstrip("/").rsplit("/", 1)[-1] or "/"
         if len(g) > 1:
             title += f" 외 {len(g) - 1}개"
-        t = manager.add("download", title, ["download", *flags, *g], {"paths": g, "saveto": saveto, **acct})
+        t = manager.add("download", title, ["download", *flags, *g], {"paths": g, "saveto": saveto, **acct, **_extract_meta(o)})
         created.append(t.to_dict())
     return {"ok": True, "tasks": created}
 
@@ -685,7 +739,55 @@ async def task_upload(body: UploadBody):
 
 @app.get("/api/tasks")
 async def tasks_list():
-    return {"tasks": manager.list(), "running": manager.running_count()}
+    cfg = pcs.read_config()
+    return {"tasks": manager.list(), "running": manager.running_count(), "state": manager.public_state(),
+            "rate": pcs.config_values(cfg).get("max_download_rate", "0")}
+
+
+@app.post("/api/tasks/pause_all")
+async def tasks_pause_all():
+    await manager.pause_all()
+    return {"ok": True, "state": manager.public_state()}
+
+
+@app.post("/api/tasks/resume_all")
+async def tasks_resume_all():
+    manager.resume_all()
+    return {"ok": True, "state": manager.public_state()}
+
+
+@app.put("/api/tasks/settings")
+async def tasks_settings(values: dict[str, Any]):
+    return {"ok": True, "state": manager.update_state(values)}
+
+
+class SpeedBody(BaseModel):
+    rate: str = "0"
+    restart: bool = False
+
+
+@app.put("/api/tasks/speed")
+async def tasks_speed(body: SpeedBody):
+    rate = body.rate.strip().upper() or "0"
+    rc, out = await pcs.run(["config", "set", f"--max_download_rate={rate}"], timeout=30)
+    if "保存配置成功" not in out:
+        raise HTTPException(400, "속도 값을 확인하세요. 예: 0, 500KB, 2MB")
+    restarted = await manager.restart_running() if body.restart else 0
+    return {"ok": True, "rate": pcs.config_values(pcs.read_config()).get("max_download_rate"), "restarted": restarted}
+
+
+class MoveBody(BaseModel):
+    where: str
+
+
+@app.post("/api/tasks/{tid}/move")
+async def task_move(tid: str, body: MoveBody):
+    return {"ok": manager.move(tid, body.where)}
+
+
+@app.post("/api/tasks/{tid}/run_now")
+async def task_run_now(tid: str):
+    return {"ok": manager.run_now(tid)}
 
 
 @app.get("/api/tasks/{tid}")

@@ -442,3 +442,12 @@ details.adv[open] summary { border-bottom: 1px solid var(--line); margin-bottom:
 .tag.acct { background: transparent; border: 1px solid var(--line); font-weight: 500; }
 .mode-seg { flex-wrap: wrap; }
 .mode-seg button { padding: 6px 12px; }
+
+/* ------------------------------------------------------------ 전송 제어 */
+.task-chips { padding: 0 18px 14px; }
+.rot svg { transform: rotate(180deg); }
+.dlg-sub { margin: 0 0 8px; font-size: 14px; }
+.dlg-sub + .check { margin-bottom: 2px; }
+.modal-body .dlg-sub:not(:first-child) { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
+.tfile .r-wrap { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
+.pc-dl { font-size: 12px; }
