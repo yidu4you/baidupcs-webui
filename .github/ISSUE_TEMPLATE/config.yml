@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: BaiduPCS-Go 자체 문제
+    url: https://github.com/qjfoidnh/BaiduPCS-Go/issues
+    about: 웹 UI 가 아니라 BaiduPCS-Go 명령 자체의 문제라면 원 프로젝트에 알려 주세요.

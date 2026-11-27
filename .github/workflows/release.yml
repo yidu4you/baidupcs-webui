@@ -1,0 +1,86 @@
+name: Release
+
+# v0.0.1 같은 태그를 push 하면
+#  1) ghcr.io/yidu4you/baidupcs-webui 에 amd64/arm64 이미지를 올리고
+#  2) GitHub Release 를 만들어 DSM 용 zip(바이너리 포함)을 첨부합니다.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  PCS_VERSION: v4.0.2
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 버전 확인
+        id: ver
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          FILE="$(cat VERSION)"
+          if [ "$TAG" != "$FILE" ]; then
+            echo "태그($TAG)와 VERSION 파일($FILE)이 다릅니다." >&2
+            exit 1
+          fi
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 이미지 빌드·업로드 (amd64, arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            PCS_VERSION=${{ env.PCS_VERSION }}
+            APP_VERSION=${{ steps.ver.outputs.version }}
+          tags: |
+            ${{ steps.ver.outputs.image }}:${{ steps.ver.outputs.version }}
+            ${{ steps.ver.outputs.image }}:latest
+
+      - name: DSM 용 zip 만들기 (BaiduPCS-Go 바이너리 포함)
+        run: |
+          set -eux
+          NAME="baidupcs-webui-${{ steps.ver.outputs.version }}"
+          mkdir -p "dist/$NAME"
+          git archive HEAD | tar -x -C "dist/$NAME"
+          rm -rf "dist/$NAME/.github"
+          for arch in amd64 arm64; do
+            curl -fsSL -o /tmp/pcs.zip \
+              "https://github.com/qjfoidnh/BaiduPCS-Go/releases/download/${PCS_VERSION}/BaiduPCS-Go-${PCS_VERSION}-linux-${arch}.zip"
+            rm -rf /tmp/pcs && unzip -q /tmp/pcs.zip -d /tmp/pcs
+            install -m 0755 /tmp/pcs/*/BaiduPCS-Go "dist/$NAME/bin/BaiduPCS-Go-linux-${arch}"
+          done
+          curl -fsSL -o "dist/$NAME/bin/LICENSE.BaiduPCS-Go" \
+            "https://raw.githubusercontent.com/qjfoidnh/BaiduPCS-Go/${PCS_VERSION}/LICENSE"
+          (cd dist && zip -qr "$NAME-dsm.zip" "$NAME")
+
+      - name: 릴리즈 노트 추출
+        run: |
+          awk -v v="${{ steps.ver.outputs.version }}" '
+            $0 ~ "^## \\[" v "\\]" {f=1; next}
+            f && /^## \[/ {exit}
+            f && !/^\[/ {print}
+          ' CHANGELOG.md > dist/notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: v${{ steps.ver.outputs.version }}
+          body_path: dist/notes.md
+          files: dist/baidupcs-webui-${{ steps.ver.outputs.version }}-dsm.zip

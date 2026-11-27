@@ -1,0 +1,9 @@
+.git
+.github
+config/
+uploads/
+__pycache__/
+*.pyc
+*.zip
+*.md
+!README.md

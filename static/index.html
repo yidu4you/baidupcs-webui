@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>BaiduPCS Web</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%232E4BE0'/><path d='M9 20.5a5 5 0 0 1 .6-9.9 7 7 0 0 1 13.2 2.2A4 4 0 0 1 23 20.5z' fill='white'/><path d='M16 13v8m-3-3 3 3 3-3' stroke='%232E4BE0' stroke-width='2' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+KR:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/vendor/xterm.css">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div id="app">
+  <aside class="rail" id="rail">
+    <div class="brand">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M9 20.5a5 5 0 0 1 .6-9.9 7 7 0 0 1 13.2 2.2A4 4 0 0 1 23 20.5z" fill="currentColor"/><path d="M16 13v8m-3-3 3 3 3-3" stroke="var(--rail)" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <div>
+        <strong>BaiduPCS Web</strong>
+        <span id="brand-sub">넷디스크 관리</span>
+      </div>
+    </div>
+    <nav id="nav"></nav>
+    <div class="rail-foot">
+      <div class="gauge" id="gauge" hidden>
+        <div class="gauge-text"><span id="gauge-used">-</span><span id="gauge-total">-</span></div>
+        <div class="gauge-bar"><i id="gauge-fill"></i></div>
+      </div>
+      <button class="rail-link" id="web-logout" hidden>웹 UI 로그아웃</button>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim"></div>
+  <main class="main">
+    <header class="topbar">
+      <button class="icon-btn menu-btn" id="menu-btn" aria-label="메뉴 열기">
+        <svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+      </button>
+      <h1 id="page-title"></h1>
+      <div class="top-right">
+        <a class="account-chip" id="account-chip" href="#/account"></a>
+      </div>
+    </header>
+    <section class="content" id="view"></section>
+  </main>
+</div>
+<div id="modal-root"></div>
+<div id="toasts" aria-live="polite"></div>
+
+<script src="/static/vendor/xterm.js"></script>
+<script src="/static/vendor/addon-fit.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

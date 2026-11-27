@@ -1,0 +1,47 @@
+# baidupcs-webui 0.0.1 — Synology DSM 컨테이너 매니저용
+# https://github.com/yidu4you/baidupcs-webui
+#
+# DSM 컨테이너 매니저 > 프로젝트 > 생성 에서 이 폴더를 경로로 고르면
+# 이 파일을 그대로 사용합니다. 접속 주소: http://NAS-IP:8777
+
+services:
+  baidupcs-web:
+    # 소스에서 직접 빌드합니다.
+    # GitHub Actions 로 만든 이미지를 쓰려면 build: 블록을 지우고 image 를
+    # ghcr.io/yidu4you/baidupcs-webui:0.0.1 로 바꾸세요.
+    build:
+      context: .
+      args:
+        PCS_VERSION: v4.0.2
+        APP_VERSION: 0.0.1
+    image: baidupcs-webui:0.0.1
+    container_name: baidupcs-web
+    restart: unless-stopped
+    ports:
+      - "8777:8777"
+    environment:
+      TZ: Asia/Seoul
+      WEB_PORT: "8777"
+
+      # 웹 UI 접속 비밀번호. 반드시 바꾸세요. (비워두면 비밀번호 없이 열립니다)
+      WEB_PASSWORD: "change-this-password"
+
+      # 다운로드한 파일의 소유자. DSM 에서 SSH 로 `id 사용자이름` 을 실행하면 확인할 수 있습니다.
+      # DSM 첫 관리자 계정은 보통 uid=1026, users 그룹 gid=100 입니다.
+      PUID: "1026"
+      PGID: "100"
+      UMASK: "022"
+
+      # 동시에 실행할 다운로드/업로드 작업 수 (일반 회원은 1 권장)
+      MAX_CONCURRENT_TASKS: "1"
+
+      # 화면 표시용 NAS 실제 경로 (아래 volumes 와 맞춰 주세요)
+      HOST_DOWNLOAD_DIR: /volume2/media/downloads
+      HOST_UPLOAD_DIR: /volume2/media/downloads/_upload
+    volumes:
+      # 다운로드 저장 위치 (NAS 폴더 : 컨테이너 폴더)
+      - /volume2/media/downloads:/downloads
+      # 넷디스크로 올릴 파일을 두는 폴더 (원하는 NAS 폴더로 바꿔도 됩니다)
+      - /volume2/media/downloads/_upload:/uploads
+      # 로그인 정보·설정·작업 기록 (프로젝트 폴더 안에 저장)
+      - ./config:/config
