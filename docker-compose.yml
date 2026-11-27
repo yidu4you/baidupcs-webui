@@ -35,6 +35,9 @@ services:
       # 동시에 실행할 다운로드/업로드 작업 수 (일반 회원은 1 권장)
       MAX_CONCURRENT_TASKS: "1"
 
+      # 다운로드 중 NAS 여유 공간이 이보다 작아지면 자동으로 멈춥니다 (0 이면 끔)
+      MIN_FREE_SPACE: "1GB"
+
       # 화면 표시용 NAS 실제 경로 (아래 volumes 와 맞춰 주세요)
       HOST_DOWNLOAD_DIR: /volume2/media/downloads
       HOST_UPLOAD_DIR: /volume2/media/downloads/_upload

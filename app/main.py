@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import pcs, settings
+from . import notify, pcs, settings
 from .tasks import manager
 from .terminal import terminal_session
 
@@ -174,6 +174,8 @@ async def info():
         "host_upload_dir": settings.HOST_UPLOAD_DIR,
         "config_dir": settings.CONFIG_DIR,
         "max_concurrent_tasks": settings.MAX_CONCURRENT_TASKS,
+        "min_free_bytes": settings.MIN_FREE_BYTES,
+        "relay_root": settings.RELAY_ROOT,
         **pcs.public_accounts(cfg),
     }
 
@@ -416,38 +418,76 @@ async def fs_match(pattern: str):
 
 
 # ======================================================================= 전송(转存)
+class DownloadOptions(BaseModel):
+    saveto: str = ""
+    overwrite: bool = False
+    mode: str = "locate"
+    threads: int = 0
+    load: int = 0
+    retry: int = 3
+    nocheck: bool = False
+    mtime: bool = False
+    fullpath: bool = False
+    test: bool = False
+    dindex: int = 0
+    exec_perm: bool = False
+
+
 class TransferBody(BaseModel):
     link: str
     code: str = ""
     dest: str = "/"
-    download: bool = False
+    # save: 넷디스크에만 저장 / download: 저장 후 NAS 로 다운로드 / relay: 다운로드 후 넷디스크에서 삭제
+    mode: str = "save"
+    download: bool = False      # 예전 방식 호환 (mode="download" 와 같음)
     collect: bool = False
     rname: bool = False
     fs_id: str = ""
+    saveto: str = ""
+    purge_recycle: bool = True
+    options: DownloadOptions | None = None
 
 
 @app.post("/api/transfer")
 async def transfer(body: TransferBody):
+    mode = "download" if body.download and body.mode == "save" else body.mode
+    link, code = body.link.strip(), body.code.strip()
+    if not link:
+        raise HTTPException(400, "공유 링크를 입력하세요.")
+    dest = _abs(body.dest)
+    if mode in ("download", "relay"):
+        acct = await _account_meta()
+        saveto = _resolve_local(None, None, body.saveto or settings.DOWNLOAD_DIR)
+        o = body.options or DownloadOptions()
+        meta = {
+            **acct, "link": link, "code": code, "collect": body.collect, "rname": body.rname,
+            "fs_id": body.fs_id.strip(), "saveto": saveto, "dl_flags": _download_flags(o),
+            "delete_after": mode == "relay", "purge_recycle": body.purge_recycle, "stage": "transfer",
+        }
+        label = "공유 링크" + (f" ({code})" if code else "")
+        t = manager.add("relay", label, [], meta)
+        # 경유 모드는 작업마다 전용 임시 폴더를 써서, 받은 뒤 그 폴더만 지운다
+        t.meta["netdisk_dir"] = f"{settings.RELAY_ROOT}/{t.id}" if mode == "relay" else dest
+        manager.save(force=True)
+        return {"ok": True, "task": t.to_dict(), "output": "전송 현황에 작업을 추가했습니다."}
     args = ["transfer"]
-    if body.download:
-        args.append("--download")
     if body.collect:
         args.append("--collect")
     if body.rname:
         args.append("--rname")
     if body.fs_id.strip():
         args.append(f"--fs_id={body.fs_id.strip()}")
-    args.append(body.link.strip())
-    if body.code.strip():
-        args.append(body.code.strip())
-    dest = _abs(body.dest)
-    if body.download:
-        t = manager.add("transfer", f"공유 링크 저장 후 다운로드 → {dest}", args, {"pre_cd": dest})
-        return {"ok": True, "task": t.to_dict(), "output": "작업 목록에 추가했습니다."}
+    args.append(link)
+    if code:
+        args.append(code)
     # transfer 는 현재 작업 디렉터리에 저장되므로 먼저 cd 한다
     rc1, out1 = await pcs.run(["cd", dest])
     rc, out = await pcs.run(args, timeout=300)
-    return {"ok": not _looks_failed(out), "output": out}
+    ok = "成功" in out and not _looks_failed(out.replace("成功", ""))
+    hint = ""
+    if not ok and ("空间" in out or "容量" in out):
+        hint = "넷디스크 용량이 부족한 것 같습니다. 휴지통을 비우거나, ‘받고 넷디스크에서 삭제(경유)’ 모드를 써 보세요."
+    return {"ok": ok, "output": out, "hint": hint}
 
 
 # ======================================================================= 공유
@@ -537,21 +577,6 @@ async def recycle_action(action: str, body: IdsBody):
 
 
 # ======================================================================= 작업 (다운로드/업로드)
-class DownloadOptions(BaseModel):
-    saveto: str = ""
-    overwrite: bool = False
-    mode: str = "locate"
-    threads: int = 0
-    load: int = 0
-    retry: int = 3
-    nocheck: bool = False
-    mtime: bool = False
-    fullpath: bool = False
-    test: bool = False
-    dindex: int = 0
-    exec_perm: bool = False
-
-
 class DownloadBody(BaseModel):
     paths: list[str]
     options: DownloadOptions = DownloadOptions()
@@ -573,12 +598,17 @@ def _resolve_local(root_key: str | None, rel: str | None, abs_path: str | None =
     raise HTTPException(400, "허용된 폴더(다운로드/업로드) 밖의 경로입니다.")
 
 
-@app.post("/api/tasks/download")
-async def task_download(body: DownloadBody):
-    o = body.options
-    saveto = _resolve_local(None, None, o.saveto or settings.DOWNLOAD_DIR)
-    os.makedirs(saveto, exist_ok=True)
-    flags = [f"--saveto={saveto}", f"--mode={o.mode}", f"--retry={o.retry}"]
+async def _account_meta() -> dict:
+    """작업을 만든 시점의 활성 계정. 작업은 나중에 시작돼도 이 계정으로 실행된다."""
+    cfg = await pcs.read_config_safe()
+    cur = pcs.public_accounts(cfg)["current"]
+    if not cur:
+        raise HTTPException(400, "먼저 바이두 계정에 로그인하세요.")
+    return {"uid": cur["uid"], "account": cur["name"] or cur["uid"]}
+
+
+def _download_flags(o: DownloadOptions) -> list[str]:
+    flags = [f"--mode={o.mode}", f"--retry={o.retry}"]
     if o.overwrite:
         flags.append("--ow")
     if o.threads > 0:
@@ -597,6 +627,16 @@ async def task_download(body: DownloadBody):
         flags.append(f"--dindex={o.dindex}")
     if o.exec_perm:
         flags.append("-x")
+    return flags
+
+
+@app.post("/api/tasks/download")
+async def task_download(body: DownloadBody):
+    o = body.options
+    saveto = _resolve_local(None, None, o.saveto or settings.DOWNLOAD_DIR)
+    os.makedirs(saveto, exist_ok=True)
+    flags = [f"--saveto={saveto}", *_download_flags(o)]
+    acct = await _account_meta()
     paths = list(map(_abs, _clean_paths(body.paths)))
     groups = [[p] for p in paths] if body.separate else [paths]
     created = []
@@ -604,7 +644,7 @@ async def task_download(body: DownloadBody):
         title = g[0].rstrip("/").rsplit("/", 1)[-1] or "/"
         if len(g) > 1:
             title += f" 외 {len(g) - 1}개"
-        t = manager.add("download", title, ["download", *flags, *g], {"paths": g, "saveto": saveto})
+        t = manager.add("download", title, ["download", *flags, *g], {"paths": g, "saveto": saveto, **acct})
         created.append(t.to_dict())
     return {"ok": True, "tasks": created}
 
@@ -638,7 +678,8 @@ async def task_upload(body: UploadBody):
         flags.append(f"-l={o.load}")
     dest = _abs(body.dest)
     title = os.path.basename(locals_[0].rstrip("/")) + (f" 외 {len(locals_) - 1}개" if len(locals_) > 1 else "")
-    t = manager.add("upload", f"{title} → {dest}", ["upload", *flags, *locals_, dest], {"local_paths": locals_, "dest": dest})
+    acct = await _account_meta()
+    t = manager.add("upload", f"{title} → {dest}", ["upload", *flags, *locals_, dest], {"local_paths": locals_, "dest": dest, **acct})
     return {"ok": True, "task": t.to_dict()}
 
 
@@ -764,6 +805,60 @@ async def local_file(path: str):
     return FileResponse(real, filename=os.path.basename(real))
 
 
+# ======================================================================= 용량 확인
+class SizeBody(BaseModel):
+    paths: list[str]
+
+
+@app.post("/api/fs/size")
+async def fs_size(body: SizeBody):
+    """폴더를 하나씩 조회해 전체 크기를 구한다 (최대 60초 / 폴더 1000개)."""
+    started = time.time()
+    total, files, queue, scanned = 0, 0, list(map(_abs, _clean_paths(body.paths))), 0
+    while queue and scanned < 1000 and time.time() - started < 60:
+        rc, out = await pcs.run(["ls", "-l", queue.pop(0)], timeout=60)
+        scanned += 1
+        cur = pcs.extract_current_dir(out)
+        if cur is None:
+            continue
+        for it in pcs.parse_file_table(out, base=cur):
+            if it["is_dir"]:
+                queue.append(it["path"])
+            else:
+                total += it["size"]
+                files += 1
+    return {"total": total, "files": files, "dirs": scanned, "complete": not queue}
+
+
+@app.get("/api/local/disk")
+async def local_disk(path: str = ""):
+    real = _resolve_local(None, None, path or settings.DOWNLOAD_DIR)
+    while not os.path.isdir(real):
+        real = os.path.dirname(real)
+    u = shutil.disk_usage(real)
+    return {"path": real, "total": u.total, "used": u.used, "free": u.free, "min_free": settings.MIN_FREE_BYTES}
+
+
+# ======================================================================= 알림
+@app.get("/api/notify")
+async def notify_get():
+    return notify.public()
+
+
+@app.put("/api/notify")
+async def notify_put(values: dict[str, Any]):
+    return notify.public(notify.update(values))
+
+
+@app.post("/api/notify/test")
+async def notify_test():
+    cfg = notify.load()
+    res = await notify.send("🔔 baidupcs-webui 알림 테스트입니다. 이 메시지가 보이면 설정이 맞습니다.", "test", cfg=cfg)
+    if not res:
+        raise HTTPException(400, "설정된 알림 채널이 없습니다. 먼저 저장하세요.")
+    return {"results": res}
+
+
 # ======================================================================= 설정
 @app.get("/api/config")
 async def config_get():
@@ -833,7 +928,11 @@ async def exec_command(body: ExecBody):
     if args[0] in ("download", "d", "upload", "u"):
         # 긴 작업은 작업 관리자로 보낸다
         kind = "download" if args[0] in ("download", "d") else "upload"
-        t = manager.add(kind, "명령: " + " ".join(args[1:])[:80], ["download" if kind == "download" else "upload", *args[1:]])
+        acct = await _account_meta()
+        meta = {**acct}
+        if kind == "download":
+            meta["saveto"] = pcs.read_config().get("savedir") or settings.DOWNLOAD_DIR
+        t = manager.add(kind, "명령: " + " ".join(args[1:])[:80], ["download" if kind == "download" else "upload", *args[1:]], meta)
         return {"ok": True, "output": f"작업 목록에 추가했습니다. (작업 ID {t.id})", "task": t.to_dict()}
     started = time.time()
     rc, out = await pcs.run(args, stdin_data=body.stdin)

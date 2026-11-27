@@ -340,9 +340,31 @@ async function refreshQuota() {
 async function pollBadge() {
   try {
     const r = await GET("/api/tasks");
+    trackTaskStatus(r.tasks);
     if (r.running !== state.running) { state.running = r.running; renderNav(currentRoute().page); }
   } catch { /* 무시 */ }
 }
+
+// 작업이 끝나면 화면 안 토스트와 (켜 두었다면) 브라우저 알림으로 알려준다
+const taskStatus = new Map();
+let taskStatusReady = false;
+function trackTaskStatus(tasks) {
+  for (const t of tasks) {
+    const prev = taskStatus.get(t.id);
+    taskStatus.set(t.id, t.status);
+    if (!taskStatusReady || !prev || prev === t.status) continue;
+    if (!["running", "queued"].includes(prev) || !["done", "failed"].includes(t.status)) continue;
+    const ok = t.status === "done";
+    const msg = `${ok ? "완료" : "실패"}: ${t.title}`;
+    toast(msg, ok ? "ok" : "err");
+    if (document.hidden && browserNotifyOn()) {
+      try { new Notification(ok ? "전송 완료" : "전송 실패", { body: t.title + (ok ? "" : "\n" + (t.error || "")), tag: t.id }); } catch { /* 무시 */ }
+    }
+  }
+  taskStatusReady = true;
+}
+const browserNotifySupported = () => "Notification" in window && window.isSecureContext;
+const browserNotifyOn = () => browserNotifySupported() && Notification.permission === "granted" && store.get("browserNotify", false);
 
 function requireLogin(view) {
   if (state.info && state.info.current) return true;
@@ -397,7 +419,7 @@ PAGES.files = (view, params) => {
     h("button", { class: "icon-btn", title: "새로고침", onclick: () => load() }, icon("refresh")),
     h("button", { class: "icon-btn", title: "새 폴더", onclick: mkdir }, icon("folderPlus")),
     h("button", { class: "icon-btn", title: "더 보기", onclick: (e) => popMenu(e.currentTarget, [
-      { label: "이 폴더 전체 다운로드", onClick: () => downloadDialog([st.path]) },
+      { label: "이 폴더 전체 다운로드", onClick: () => downloadDialog([st.path], [{ path: st.path, is_dir: true, size: 0 }]) },
       { label: "트리 보기", onClick: () => treeDialog(st.path) },
       { label: "폴더 정보 (meta)", onClick: () => metaDialog(st.path) },
       "-",
@@ -413,6 +435,9 @@ PAGES.files = (view, params) => {
   view.append(h("div", { class: "panel" }, toolbar, selbar, listWrap, foot));
 
   function open(p) { go("files", { path: p }); }
+  // 목록에서 이미 아는 크기·종류 정보를 다운로드 창에 넘겨 용량 계산을 빠르게 한다
+  const infoOf = (paths) => paths.map((p) => [...(st.searchResults || []), ...st.items].find((i) => i.path === p) || { path: p, is_dir: true, size: 0 });
+  const dl = (paths) => downloadDialog(paths, infoOf(paths));
 
   function renderCrumbs() {
     const parts = st.path.split("/").filter(Boolean);
@@ -436,7 +461,7 @@ PAGES.files = (view, params) => {
     if (!n) return;
     const paths = [...st.selected];
     selbar.replaceChildren(h("strong", null, `${n}개 선택`),
-      h("button", { class: "btn sm primary", onclick: () => downloadDialog(paths) }, icon("download"), "다운로드"),
+      h("button", { class: "btn sm primary", onclick: () => dl(paths) }, icon("download"), "다운로드"),
       h("button", { class: "btn sm", onclick: () => copyMove("cp", paths) }, "복사"),
       h("button", { class: "btn sm", onclick: () => copyMove("mv", paths) }, "이동"),
       h("button", { class: "btn sm", onclick: () => shareDialog(paths) }, "공유"),
@@ -480,13 +505,13 @@ PAGES.files = (view, params) => {
         ? h("a", { onclick: () => open(it.path), title: it.path }, it.name)
         : h("span", { class: "n", title: it.path }, it.name);
       const sub = st.searchResults ? h("span", { class: "sub" }, parentPath(it.path)) : null;
-      const tr = h("tr", { class: st.selected.has(it.path) ? "selected" : "", ondblclick: () => it.is_dir ? open(it.path) : downloadDialog([it.path]) },
+      const tr = h("tr", { class: st.selected.has(it.path) ? "selected" : "", ondblclick: () => it.is_dir ? open(it.path) : dl([it.path]) },
         h("td", { class: "c-check" }, cb),
         h("td", null, h("div", { class: "fname" }, fileIcon(it.name, it.is_dir), h("div", { style: { minWidth: 0 } }, nameCell, sub))),
         h("td", { class: "c-size" }, it.is_dir ? h("span", { class: "muted" }, "—") : fmtSize(it.size)),
         h("td", { class: "c-time" }, it.mtime),
         h("td", { class: "c-act" }, h("div", { class: "row-actions" },
-          h("button", { class: "icon-btn plain", title: "다운로드", onclick: () => downloadDialog([it.path]) }, icon("download")),
+          h("button", { class: "icon-btn plain", title: "다운로드", onclick: () => dl([it.path]) }, icon("download")),
           h("button", { class: "icon-btn plain", title: "더 보기", onclick: (e) => popMenu(e.currentTarget, rowMenu(it)) }, icon("more")))));
       return tr;
     });
@@ -504,7 +529,7 @@ PAGES.files = (view, params) => {
 
   function rowMenu(it) {
     return [
-      { label: "다운로드…", onClick: () => downloadDialog([it.path]) },
+      { label: "다운로드…", onClick: () => dl([it.path]) },
       it.is_dir ? { label: "열기", onClick: () => open(it.path) } : { label: "다운로드 직링크 보기", onClick: () => locateDialog([it.path]) },
       "-",
       { label: "이름 바꾸기", onClick: () => rename(it) },
@@ -593,10 +618,47 @@ PAGES.files = (view, params) => {
 // ------------------------------------------------------------ 파일 관련 대화상자
 const DL_DEFAULTS = { overwrite: false, mode: "locate", threads: 0, load: 0, retry: 3, nocheck: false, mtime: true, fullpath: false, test: false, dindex: 0, exec_perm: false, separate: false };
 
-async function downloadDialog(paths) {
+async function downloadDialog(paths, info) {
   if (!paths.length) return;
   const o = { ...DL_DEFAULTS, ...store.get("dlopts", {}) };
-  const saveto = h("input", { class: "input", value: store.get("dlSaveto", state.info.download_dir) });
+  const saveto = h("input", { class: "input", value: store.get("dlSaveto", state.info.download_dir), onchange: () => updateSpace() });
+
+  // ---- 필요 공간과 NAS 여유 공간 비교
+  info = info || paths.map((p) => ({ path: p, is_dir: true, size: 0 }));
+  const space = h("div", { class: "space-check" }, h("span", { class: "muted" }, "필요한 공간 계산 중…"));
+  const need = { total: info.filter((i) => !i.is_dir).reduce((a, b) => a + b.size, 0), files: info.filter((i) => !i.is_dir).length, complete: true, done: false };
+  let disk = null, closed = false;
+  function renderSpace() {
+    if (!need.done || !disk) {
+      space.replaceChildren(h("span", { class: "muted" }, need.done ? "NAS 여유 공간 확인 중…" : "필요한 공간 계산 중… (폴더가 크면 조금 걸립니다)"));
+      return;
+    }
+    const usable = disk.free - disk.min_free;
+    const over = need.total > usable;
+    space.className = "space-check " + (over ? "bad" : "ok");
+    space.replaceChildren(
+      h("div", null, h("strong", null, `필요 약 ${fmtSize(need.total)}${need.complete ? "" : " 이상"}`), ` (파일 ${need.files}개)`),
+      h("div", null, `NAS 여유 ${fmtSize(disk.free)}`),
+      over ? h("div", { class: "warn-line" }, `여유 공간이 부족합니다. 최소 여유 ${fmtSize(disk.min_free)} 를 남기려면 ${fmtSize(need.total - usable)} 를 더 비워야 합니다. 그래도 시작하면 공간이 기준 아래로 떨어질 때 자동으로 멈춥니다.`) : null,
+      need.complete ? null : h("div", { class: "muted small" }, "폴더가 너무 많아 일부만 계산했습니다."));
+  }
+  async function updateSpace() {
+    disk = null; renderSpace();
+    try { disk = await GET("/api/local/disk?" + qs({ path: saveto.value.trim() })); } catch (e) { space.replaceChildren(h("span", { class: "warn-text" }, e.message)); return; }
+    if (!closed) renderSpace();
+  }
+  (async () => {
+    const dirs = info.filter((i) => i.is_dir).map((i) => i.path);
+    if (dirs.length) {
+      try {
+        const r = await POST("/api/fs/size", { paths: dirs });
+        need.total += r.total; need.files += r.files; need.complete = r.complete;
+      } catch { need.complete = false; }
+    }
+    need.done = true;
+    if (!closed) renderSpace();
+  })();
+  updateSpace();
   const chk = (k, label, sub) => h("label", { class: "check" }, h("input", { type: "checkbox", checked: !!o[k], onchange: (e) => { o[k] = e.target.checked; } }), h("span", null, label, sub && h("small", null, sub)));
   const num = (k, label, help) => h("div", { class: "field" }, h("label", null, label),
     h("input", { class: "input", type: "number", min: 0, value: o[k], oninput: (e) => { o[k] = parseInt(e.target.value || "0", 10); } }), help && h("p", { class: "help" }, help));
@@ -606,8 +668,9 @@ async function downloadDialog(paths) {
   const body = [
     list,
     h("div", { class: "field" }, h("label", null, "NAS 저장 위치"),
-      h("div", { class: "input-row" }, saveto, h("button", { class: "btn", type: "button", onclick: async () => { const p = await pickLocalFolder(saveto.value); if (p) saveto.value = p; } }, "찾아보기")),
+      h("div", { class: "input-row" }, saveto, h("button", { class: "btn", type: "button", onclick: async () => { const p = await pickLocalFolder(saveto.value); if (p) { saveto.value = p; updateSpace(); } } }, "찾아보기")),
       h("p", { class: "help" }, state.info.host_download_dir ? `${state.info.download_dir} = NAS 의 ${state.info.host_download_dir}` : `${state.info.download_dir} 는 docker-compose 에서 연결한 NAS 폴더입니다.`)),
+    space,
     h("div", { class: "checks" },
       chk("mtime", "원본 수정 시간 유지", "넷디스크의 수정 시간을 그대로 씁니다"),
       chk("fullpath", "넷디스크 전체 경로로 저장", "/영상/a.mp4 → 저장위치/영상/a.mp4"),
@@ -622,7 +685,7 @@ async function downloadDialog(paths) {
         chk("nocheck", "완료 후 검증 생략"), chk("test", "테스트 다운로드", "파일을 저장하지 않음"), chk("exec_perm", "실행 권한 추가 (-x)"))),
     h("p", { class: "help", style: { margin: 0 } }, "일반 회원은 스레드를 늘리면 오히려 속도 제한에 걸리기 쉽습니다. 다시 받을 때는 이어받기가 됩니다."),
   ];
-  const res = await modal({ title: `다운로드 (${paths.length}개)`, body, actions: [
+  const res = await modal({ title: `다운로드 (${paths.length}개)`, body, onClose: () => { closed = true; }, actions: [
     { label: "취소" },
     { label: "다운로드 시작", kind: "primary", onClick: async () => {
       const { separate, ...opts } = o;
@@ -737,13 +800,18 @@ PAGES.tasks = (view) => {
   const cards = new Map();   // task id → card
   let lastTasks = [];
 
-  function kindLabel(k) { return { download: "다운로드", upload: "업로드", transfer: "링크 저장" }[k] || k; }
+  function kindLabel(t) {
+    if (t.kind === "relay") return t.meta && t.meta.delete_after ? "경유 받기" : "링크 받기";
+    return { download: "다운로드", upload: "업로드", transfer: "링크 저장" }[t.kind] || t.kind;
+  }
 
   function createCard(t) {
     const c = { id: t.id, rows: new Map(), actionsKey: "" };
     c.statusTag = h("span");
     c.kindTag = h("span", { class: "tag" });
+    c.acctTag = h("span", { class: "tag acct", hidden: true });
     c.title = h("span", { class: "task-title" });
+    c.phase = h("div", { class: "task-phase", hidden: true });
     c.actions = h("div", { class: "row-actions", style: { gap: "6px", alignItems: "center" } });
     c.laneFill = h("i");
     c.lane = h("div", { class: "lane" }, c.laneFill);
@@ -761,8 +829,8 @@ PAGES.tasks = (view) => {
     c.filesList = h("div", { class: "task-files" });
     c.filesWrap = h("div", { hidden: true }, c.filesBar, c.filesList);
     c.el = h("div", { class: "task" },
-      h("div", { class: "task-head" }, c.statusTag, c.kindTag, c.title, h("span", { class: "spacer" }), c.actions),
-      c.lane, h("div", { class: "row", style: { gap: "14px", marginTop: "8px", alignItems: "baseline" } }, c.meta, c.toggle),
+      h("div", { class: "task-head" }, c.statusTag, c.kindTag, c.acctTag, c.title, h("span", { class: "spacer" }), c.actions),
+      c.phase, c.lane, h("div", { class: "row", style: { gap: "14px", marginTop: "8px", alignItems: "baseline" } }, c.meta, c.toggle),
       c.err, c.filesWrap);
     return c;
   }
@@ -782,7 +850,9 @@ PAGES.tasks = (view) => {
         popMenu(e.currentTarget, [
           t2.meta && t2.meta.saveto ? { label: "저장 폴더 열기 (NAS 파일)", onClick: () => openLocal(t2.meta.saveto) } : null,
           t2.meta && t2.meta.dest ? { label: "넷디스크 폴더 열기", onClick: () => go("files", { path: t2.meta.dest }) } : null,
-          { label: "명령어 복사", onClick: () => copyText("BaiduPCS-Go " + t2.args.map((a) => /\s/.test(a) ? `"${a}"` : a).join(" ")) },
+          t2.meta && t2.meta.netdisk_dir && t2.meta.stage !== "done" ? { label: "넷디스크 저장 폴더 열기", onClick: () => go("files", { path: t2.meta.netdisk_dir }) } : null,
+          t2.meta && t2.meta.link ? { label: "공유 링크 복사", onClick: () => copyText(t2.meta.code ? `${t2.meta.link}?pwd=${t2.meta.code}` : t2.meta.link) } : null,
+          t2.args && t2.args.length ? { label: "명령어 복사", onClick: () => copyText("BaiduPCS-Go " + t2.args.map((a) => /\s/.test(a) ? `"${a}"` : a).join(" ")) } : null,
           "-",
           { label: "기록에서 삭제", danger: true, onClick: async () => {
             if (c.t.status === "running" && !await confirmBox("작업 삭제", "진행 중인 작업을 중지하고 삭제할까요?", { danger: true })) return;
@@ -849,7 +919,13 @@ PAGES.tasks = (view) => {
     const pct = t.total ? Math.min(100, (t.done / t.total) * 100) : (t.status === "done" ? 100 : 0);
     const remaining = t.speed > 0 && t.total ? fmtDur((t.total - t.done) / t.speed) : "";
     setClass(c.statusTag, `tag ${tone}`); setText(c.statusTag, label);
-    setText(c.kindTag, kindLabel(t.kind));
+    setText(c.kindTag, kindLabel(t));
+    const acct = t.meta && t.meta.account;
+    c.acctTag.hidden = !acct || !state.info || state.info.accounts.length < 2;
+    if (acct) { setText(c.acctTag, acct); c.acctTag.title = "이 작업은 이 계정으로 실행됩니다"; }
+    const showPhase = !!t.phase && ["running", "failed", "stopped", "interrupted"].includes(t.status);
+    c.phase.hidden = !showPhase;
+    if (showPhase) setText(c.phase, (t.status === "running" ? "" : "멈춘 단계: ") + t.phase);
     setText(c.title, t.title); if (c.title.title !== t.title) c.title.title = t.title;
     renderActions(c, t);
     setClass(c.lane, `lane ${t.status}`); setWidth(c.laneFill, pct);
@@ -907,6 +983,7 @@ PAGES.tasks = (view) => {
     if (document.hidden) return;   // 탭이 안 보이면 쉬기
     try {
       const r = await GET("/api/tasks");
+      trackTaskStatus(r.tasks);
       if (r.running !== state.running) { state.running = r.running; renderNav("tasks"); }
       render(r.tasks);
     } catch { /* 무시 */ }
@@ -1130,50 +1207,116 @@ PAGES.transfer = (view, params) => {
   const text = h("textarea", { class: "input", rows: 5, placeholder: "공유 문구를 그대로 붙여넣으세요.\n예) 链接: https://pan.baidu.com/s/1AbCdEf 提取码: x7k2\n예) https://pan.baidu.com/s/1AbCdEf?pwd=x7k2\n여러 개를 한 번에 붙여넣어도 됩니다.", oninput: detect });
   const detected = h("div", { class: "small" });
   const dest = h("input", { class: "input", value: params.get("dest") || store.get("transferDest", store.get("lastPath", "/")) });
-  const o = { download: false, collect: false, rname: false, ...store.get("transferOpts", {}) };
+  const saveto = h("input", { class: "input", value: store.get("dlSaveto", state.info.download_dir), onchange: () => loadSpace() });
+  const o = { mode: "save", collect: false, rname: false, purge: true, ...store.get("transferOpts", {}) };
+  delete o.download;
   const chk = (k, label, sub) => h("label", { class: "check" }, h("input", { type: "checkbox", checked: o[k], onchange: (e) => { o[k] = e.target.checked; } }), h("span", null, label, sub && h("small", null, sub)));
   const fsid = h("input", { class: "input", placeholder: "선택 사항" });
   const out = h("pre", { class: "output wrap" });
+  const hintBox = h("div");
+  const spaceBox = h("div", { class: "space-box" });
   let found = [];
+
+  const MODES = [
+    ["save", "넷디스크에만 저장", "공유 파일을 내 넷디스크 폴더에 저장합니다."],
+    ["download", "저장 후 NAS 로 받기", "넷디스크에 저장한 뒤 NAS 로 다운로드합니다. 넷디스크에도 남습니다."],
+    ["relay", "받고 넷디스크에서 삭제 (경유)", "넷디스크 임시 폴더에 저장 → NAS 로 다운로드 → 넷디스크와 휴지통에서 삭제. 무료 용량이 작아도 계속 받을 수 있습니다."],
+  ];
+  const modeSeg = h("div", { class: "seg mode-seg" });
+  const modeHelp = h("p", { class: "help", style: { margin: "6px 0 0" } });
+  const destField = h("div", { class: "field" }, h("label", null, "저장할 넷디스크 폴더"), h("div", { class: "input-row" }, dest,
+    h("button", { class: "btn", onclick: async () => { const p = await pickRemoteFolder(dest.value); if (p) dest.value = p; } }, "찾아보기")));
+  const savetoField = h("div", { class: "field" }, h("label", null, "NAS 저장 위치"), h("div", { class: "input-row" }, saveto,
+    h("button", { class: "btn", onclick: async () => { const p = await pickLocalFolder(saveto.value); if (p) { saveto.value = p; loadSpace(); } } }, "찾아보기")),
+    h("p", { class: "help" }, "다운로드 옵션(스레드, 덮어쓰기 등)은 마지막으로 쓴 다운로드 설정을 따릅니다."));
+  const purgeChk = chk("purge", "휴지통에서도 삭제", "이 작업이 만든 임시 폴더만 휴지통에서 지웁니다. 다른 파일은 건드리지 않습니다.");
+  const runBtn = h("button", { class: "btn primary" });
+
+  function renderMode() {
+    modeSeg.replaceChildren(...MODES.map(([k, l]) => h("button", { class: o.mode === k ? "active" : "", onclick: () => { o.mode = k; renderMode(); } }, l)));
+    modeHelp.textContent = MODES.find((m) => m[0] === o.mode)[2];
+    destField.hidden = o.mode === "relay";
+    savetoField.hidden = o.mode === "save";
+    purgeChk.hidden = o.mode !== "relay";
+    runBtn.textContent = o.mode === "save" ? "넷디스크에 저장" : "전송 작업 추가";
+    loadSpace();
+  }
+
+  async function loadSpace() {
+    const parts = [];
+    const q = state.quota;
+    if (q) {
+      const left = q.total - q.used;
+      parts.push(h("div", { class: "space-row" }, h("span", null, "넷디스크 남은 용량"), h("strong", { class: left < 2 * 1024 ** 3 ? "warn-text" : "" }, fmtSize(left))));
+    }
+    if (o.mode !== "save") {
+      try {
+        const d = await GET("/api/local/disk?" + qs({ path: saveto.value.trim() }));
+        parts.push(h("div", { class: "space-row" }, h("span", null, "NAS 여유 공간"), h("strong", { class: d.free < d.min_free * 2 ? "warn-text" : "" }, fmtSize(d.free))));
+      } catch { /* 경로 오류는 실행 때 알려줌 */ }
+    }
+    parts.push(h("p", { class: "help", style: { margin: "6px 0 0" } }, o.mode === "save"
+      ? "공유 파일의 크기는 저장하기 전에는 알 수 없습니다. 남은 용량보다 크면 저장이 실패합니다."
+      : "넷디스크에 저장한 뒤 실제 크기를 확인해서, NAS 공간이 모자라면 다운로드를 시작하지 않고 알려줍니다. 받는 중에도 NAS 여유 공간이 기준 아래로 떨어지면 자동으로 멈춥니다."));
+    spaceBox.replaceChildren(...parts);
+  }
+
   function detect() {
     found = parseShareText(text.value);
     detected.replaceChildren(...(found.length ? found.map((f) => h("div", { class: "row", style: { padding: "3px 0" } },
       h("span", { class: "tag ok" }, "인식"), h("span", { class: "mono" }, f.link), f.code ? h("span", { class: "tag accent" }, "코드 " + f.code) : h("span", { class: "tag warn" }, "코드 없음"))) :
       text.value.trim() ? [h("span", { class: "tag danger" }, "pan.baidu.com 공유 링크를 찾지 못했습니다")] : []));
   }
-  const runBtn = h("button", { class: "btn primary", onclick: () => busy(runBtn, async () => {
+
+  runBtn.addEventListener("click", () => busy(runBtn, async () => {
     if (!found.length) return toast("공유 링크를 붙여넣으세요.", "err");
     store.set("transferOpts", o); store.set("transferDest", dest.value.trim());
-    out.textContent = "";
+    if (o.mode !== "save") store.set("dlSaveto", saveto.value.trim());
+    out.textContent = ""; hintBox.replaceChildren();
+    const options = { ...DL_DEFAULTS, ...store.get("dlopts", {}) };
+    delete options.separate;
+    let added = 0;
     for (const f of found) {
       out.textContent += `▶ ${f.link}${f.code ? " (" + f.code + ")" : ""}\n`;
-      const r = await POST("/api/transfer", { link: f.link, code: f.code, dest: dest.value.trim() || "/", download: o.download, collect: o.collect, rname: o.rname, fs_id: fsid.value.trim() });
-      out.textContent += (r.output || "") + "\n\n";
+      try {
+        const r = await POST("/api/transfer", { link: f.link, code: f.code, dest: dest.value.trim() || "/", mode: o.mode,
+          collect: o.collect, rname: o.rname, fs_id: fsid.value.trim(), saveto: saveto.value.trim(), purge_recycle: o.purge, options });
+        out.textContent += (r.output || "") + "\n\n";
+        if (r.task) added++;
+        if (r.hint) hintBox.replaceChildren(h("div", { class: "notice err", style: { marginTop: "12px" } }, r.hint));
+      } catch (e) { out.textContent += "실패: " + e.message + "\n\n"; }
     }
-    toast(o.download ? "저장 후 다운로드 작업을 추가했습니다." : "저장을 마쳤습니다.", "ok");
-    refreshQuota();
-  }) }, "넷디스크에 저장");
+    if (o.mode === "save") { toast("저장을 마쳤습니다.", "ok"); refreshQuota().then(loadSpace); }
+    else if (added) {
+      toast(`${added}개 작업을 전송 현황에 추가했습니다.`, "ok");
+      hintBox.replaceChildren(h("div", { class: "row", style: { marginTop: "12px" } }, h("a", { class: "btn", href: "#/tasks" }, "전송 현황 보기")));
+      state.running = Math.max(state.running, 1); renderNav("transfer");
+    }
+  }));
 
   view.append(h("div", { class: "grid-2" },
     h("div", { class: "panel" },
-      h("div", { class: "panel-head" }, h("h2", null, "공유 링크를 내 넷디스크로 저장"), h("span", { class: "sub" }, "转存")),
+      h("div", { class: "panel-head" }, h("h2", null, "공유 링크 저장"), h("span", { class: "sub" }, "转存")),
       h("div", { class: "panel-body" },
         h("div", { class: "field" }, h("label", null, "공유 링크"), text, detected),
-        h("div", { class: "field" }, h("label", null, "저장할 넷디스크 폴더"), h("div", { class: "input-row" }, dest,
-          h("button", { class: "btn", onclick: async () => { const p = await pickRemoteFolder(dest.value); if (p) dest.value = p; } }, "찾아보기"))),
+        h("div", { class: "field" }, h("label", null, "방식"), modeSeg, modeHelp),
+        destField, savetoField,
         h("div", { class: "checks" },
-          chk("download", "저장 후 바로 NAS 로 다운로드", "전송 현황에서 진행률을 볼 수 있습니다"),
+          purgeChk,
           chk("collect", "여러 파일을 한 폴더로 묶기"),
           chk("rname", "파일명 앞 4자리 무작위 변경", "빠른 저장 성공률을 높일 때")),
         h("details", { class: "adv" }, h("summary", null, "특정 파일만 저장 (fs_id)"),
           h("div", { class: "field" }, fsid, h("p", { class: "help" }, "파일이 아주 많은 공유 폴더에서 일부만 저장할 때 씁니다."))),
-        h("div", { class: "row" }, runBtn, h("a", { class: "btn ghost", href: "#/files?" + qs({ path: dest.value }) , onclick: (e) => { e.currentTarget.href = "#/files?" + qs({ path: dest.value }); } }, "저장 폴더 열기")))),
-    h("div", { class: "panel" },
-      h("div", { class: "panel-head" }, h("h2", null, "결과")),
-      h("div", { class: "panel-body" }, out,
-        h("div", { class: "notice info", style: { marginTop: "14px", marginBottom: 0 } },
-          "링크 저장에는 로그인할 때 STOKEN 이 필요합니다. 오류가 나면 계정 화면에서 STOKEN 이 포함된 Cookies 로 다시 로그인하세요.")))));
+        h("div", { class: "row" }, runBtn, h("a", { class: "btn ghost", href: "#/files", onclick: (e) => { e.currentTarget.href = "#/files?" + qs({ path: dest.value }); } }, "저장 폴더 열기")))),
+    h("div", null,
+      h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", null, "공간")), h("div", { class: "panel-body" }, spaceBox)),
+      h("div", { class: "panel" },
+        h("div", { class: "panel-head" }, h("h2", null, "결과")),
+        h("div", { class: "panel-body" }, out, hintBox,
+          h("div", { class: "notice info", style: { marginTop: "14px", marginBottom: 0 } },
+            "링크 저장에는 로그인할 때 STOKEN 이 필요합니다. 오류가 나면 계정 화면에서 STOKEN 이 포함된 Cookies 로 다시 로그인하세요."))))));
   detect();
+  renderMode();
 };
 
 // =================================================================== 오프라인 다운로드
@@ -1533,10 +1676,67 @@ PAGES.config = async (view) => {
         h("span", { class: "spacer" }),
         h("button", { class: "btn ghost", onclick: async () => { const r = await GET("/api/config/raw"); showOutput("BaiduPCS-Go config 원문", r.output); } }, "원문 보기")),
         h("p", { class: "help", style: { margin: "10px 0 0" } }, "프리셋을 누르면 값만 채워집니다. 아래 저장 버튼을 눌러야 적용됩니다."))),
+    notifyPanel(),
     ...groups.map((g) => h("div", { class: "panel cfg-group" }, h("h3", null, g), data.schema.filter((f) => f.group === g).map(control))),
     savebar);
   refresh();
 };
+
+// ------------------------------------------------------------ 알림 설정 패널
+function notifyPanel() {
+  const body = h("div", { class: "panel-body" }, h("div", { class: "loading" }, "불러오는 중"));
+  const panel = h("div", { class: "panel", style: { marginBottom: "18px" } },
+    h("div", { class: "panel-head" }, h("h2", null, "알림"), h("span", { class: "sub" }, "다운로드가 끝나거나 실패하면 알려줍니다")), body);
+  (async () => {
+    let cfg;
+    try { cfg = await GET("/api/notify"); } catch (e) { body.replaceChildren(h("div", { class: "notice err" }, e.message)); return; }
+    const v = { ...cfg };
+    const inp = (k, ph, type = "text") => h("input", { class: "input mono", type, value: v[k] || "", placeholder: ph, oninput: (e) => { v[k] = e.target.value; } });
+    const sw = (k, label) => h("label", { class: "check" }, h("input", { type: "checkbox", checked: !!v[k], onchange: (e) => { v[k] = e.target.checked; } }), h("span", null, label));
+    const status = h("span", { class: "muted small" }, cfg.configured ? "설정됨" : "아직 설정된 채널이 없습니다");
+
+    const saveBtn = h("button", { class: "btn primary", onclick: () => busy(saveBtn, async () => {
+      const r = await api("PUT", "/api/notify", v);
+      Object.assign(v, r); status.textContent = r.configured ? "저장했습니다" : "저장했습니다 (설정된 채널 없음)";
+      toast("알림 설정을 저장했습니다.", "ok");
+    }) }, "저장");
+    const testBtn = h("button", { class: "btn", onclick: () => busy(testBtn, async () => {
+      await api("PUT", "/api/notify", v);
+      const r = await POST("/api/notify/test");
+      showOutput("알림 테스트 결과", Object.entries(r.results).map(([k, x]) => `${k}: ${x}`).join("\n"));
+    }) }, "테스트 보내기");
+
+    // 브라우저 알림 (HTTPS 에서만 가능)
+    let browserRow;
+    if (!browserNotifySupported()) {
+      browserRow = h("p", { class: "help", style: { margin: 0 } }, "브라우저 알림은 HTTPS 로 접속했을 때만 쓸 수 있습니다 (DSM 역방향 프록시 사용). 지금은 이 화면을 열어 두면 화면 안 알림만 표시됩니다.");
+    } else {
+      const bcb = h("input", { type: "checkbox", checked: browserNotifyOn(), onchange: async (e) => {
+        if (e.target.checked && Notification.permission !== "granted") {
+          const p = await Notification.requestPermission();
+          if (p !== "granted") { e.target.checked = false; toast("브라우저에서 알림 권한을 허용해야 합니다.", "err"); return; }
+        }
+        store.set("browserNotify", e.target.checked);
+      } });
+      browserRow = h("label", { class: "check" }, bcb, h("span", null, "이 브라우저에도 알림 표시", h("small", null, "탭이 다른 화면에 있을 때 데스크톱 알림을 띄웁니다")));
+    }
+
+    body.replaceChildren(
+      h("div", { class: "checks" }, sw("on_done", "완료되면 알림"), sw("on_fail", "실패하면 알림")),
+      h("div", { class: "num-grid" },
+        h("div", { class: "field" }, h("label", null, "텔레그램 봇 토큰"), inp("telegram_token", "123456789:AA..."),
+          h("p", { class: "help" }, "텔레그램 @BotFather 에서 봇을 만들면 받는 토큰입니다.")),
+        h("div", { class: "field" }, h("label", null, "텔레그램 Chat ID"), inp("telegram_chat_id", "예: 123456789"),
+          h("p", { class: "help" }, "봇에게 먼저 아무 메시지를 보낸 뒤, @userinfobot 등으로 내 ID 를 확인하세요."))),
+      h("div", { class: "field" }, h("label", null, "디스코드 웹훅 URL"), inp("discord_webhook", "https://discord.com/api/webhooks/..."),
+        h("p", { class: "help" }, "디스코드 채널 설정 → 연동 → 웹후크에서 만들 수 있습니다.")),
+      h("div", { class: "field" }, h("label", null, "일반 웹훅 URL (선택)"), inp("webhook_url", "https://..."),
+        h("p", { class: "help" }, "작업 정보를 JSON 으로 POST 합니다. 다른 자동화 도구와 연결할 때 쓰세요.")),
+      h("div", { class: "row", style: { marginBottom: "14px" } }, saveBtn, testBtn, status),
+      browserRow);
+  })();
+  return panel;
+}
 
 // =================================================================== 계정
 function parseCookieFlags(text) {

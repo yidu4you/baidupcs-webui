@@ -430,3 +430,15 @@ details.adv[open] summary { border-bottom: 1px solid var(--line); margin-bottom:
 
 .loading { padding: 40px; text-align: center; color: var(--muted); }
 .loading::before { content: ""; display: inline-block; width: 16px; height: 16px; border: 2px solid var(--muted); border-right-color: transparent; border-radius: 50%; animation: spin .7s linear infinite; vertical-align: -3px; margin-right: 8px; }
+
+/* ------------------------------------------------------------ 공간 확인 · 단계 표시 */
+.space-row { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; }
+.warn-text { color: var(--danger); }
+.space-check { border: 1px solid var(--line); border-radius: var(--r-sm); padding: 10px 12px; margin-bottom: 14px; font-size: 13px; display: flex; flex-direction: column; gap: 3px; }
+.space-check.ok { background: var(--ok-soft); border-color: transparent; }
+.space-check.bad { background: var(--danger-soft); border-color: transparent; }
+.space-check .warn-line { color: var(--danger); margin-top: 4px; }
+.task-phase { margin-top: 8px; font-size: 13px; font-weight: 500; color: var(--accent); }
+.tag.acct { background: transparent; border: 1px solid var(--line); font-weight: 500; }
+.mode-seg { flex-wrap: wrap; }
+.mode-seg button { padding: 6px 12px; }
