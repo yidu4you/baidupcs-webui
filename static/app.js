@@ -698,92 +698,222 @@ const STATUS = {
 const FSTATE = { queued: "대기", preparing: "준비 중", running: "받는 중", verifying: "검증 중", done: "완료", skipped: "건너뜀", failed: "실패", stopped: "중지", interrupted: "중단" };
 
 PAGES.tasks = (view) => {
+  // 목록을 통째로 다시 그리지 않고, 작업 카드와 파일 행을 id 로 기억해 바뀐 값만 고친다.
+  // (스크롤 위치·버튼 클릭·텍스트 선택이 갱신 때문에 끊기지 않도록)
   let filter = store.get("taskFilter", "all");
   const open = new Set(store.get("openTasks", []));
+  let hideDone = store.get("taskHideDone", false);
   const summary = h("div", { class: "task-summary" });
   const seg = h("div", { class: "seg" });
   const listEl = h("div");
+  const emptyEl = h("div", { class: "empty", hidden: true }, h("h3"), h("p", null, "내 넷디스크에서 파일을 고르고 다운로드를 누르면 여기에 표시됩니다."));
+  listEl.append(emptyEl);
   view.append(h("div", { class: "panel" }, summary), h("div", { class: "panel" },
     h("div", { class: "panel-head" }, seg, h("span", { class: "spacer" }),
+      h("label", { class: "check small", style: { padding: 0 } },
+        h("input", { type: "checkbox", checked: hideDone, onchange: (e) => { hideDone = e.target.checked; store.set("taskHideDone", hideDone); rerender(); } }),
+        "완료된 파일 숨기기"),
       h("button", { class: "btn sm", onclick: async () => { const r = await POST("/api/tasks/clear"); toast(`${r.removed}개 기록을 정리했습니다.`); tick(); } }, "끝난 작업 정리")),
     listEl));
 
   const FILTERS = [["all", "전체"], ["active", "진행·대기"], ["done", "완료"], ["problem", "실패·중지"]];
-  function renderSeg(tasks) {
-    const count = (f) => tasks.filter((t) => match(t, f)).length;
-    seg.replaceChildren(...FILTERS.map(([k, l]) => h("button", { class: filter === k ? "active" : "", onclick: () => { filter = k; store.set("taskFilter", k); render(tasks); } }, `${l} ${count(k)}`)));
-  }
   const match = (t, f) => f === "all" || (f === "active" && ["queued", "running"].includes(t.status)) || (f === "done" && t.status === "done") || (f === "problem" && ["failed", "stopped", "interrupted"].includes(t.status));
+  const segBtns = FILTERS.map(([k]) => h("button", { onclick: () => { filter = k; store.set("taskFilter", k); rerender(); } }));
+  seg.append(...segBtns);
 
-  function taskCard(t) {
+  // 요약 영역도 한 번만 만들고 숫자만 바꾼다
+  const sumRunning = h("strong"), sumQueued = h("strong"), sumSpeed = h("strong"), sumRunningLabel = h("span");
+  summary.append(
+    h("div", { class: "stat" }, sumRunning, sumRunningLabel),
+    h("div", { class: "stat" }, sumQueued, h("span", null, "대기 중")),
+    h("div", { class: "stat" }, sumSpeed, h("span", null, "현재 속도")),
+    h("span", { class: "spacer" }),
+    h("button", { class: "btn", onclick: () => go("files") }, icon("download"), "넷디스크에서 받기"));
+
+  const setText = (el, v) => { v = v == null ? "" : String(v); if (el.textContent !== v) el.textContent = v; };
+  const setClass = (el, v) => { if (el.className !== v) el.className = v; };
+  const setWidth = (el, pct) => { const w = pct.toFixed(1) + "%"; if (el.style.width !== w) el.style.width = w; };
+
+  const cards = new Map();   // task id → card
+  let lastTasks = [];
+
+  function kindLabel(k) { return { download: "다운로드", upload: "업로드", transfer: "링크 저장" }[k] || k; }
+
+  function createCard(t) {
+    const c = { id: t.id, rows: new Map(), actionsKey: "" };
+    c.statusTag = h("span");
+    c.kindTag = h("span", { class: "tag" });
+    c.title = h("span", { class: "task-title" });
+    c.actions = h("div", { class: "row-actions", style: { gap: "6px", alignItems: "center" } });
+    c.laneFill = h("i");
+    c.lane = h("div", { class: "lane" }, c.laneFill);
+    c.meta = h("div", { class: "task-meta" });
+    c.toggle = h("button", { class: "linkish", type: "button", onclick: () => {
+      open.has(c.id) ? open.delete(c.id) : open.add(c.id);
+      store.set("openTasks", [...open]);
+      updateCard(c, c.t);
+      if (open.has(c.id)) jumpToActive(c);
+    } });
+    c.err = h("div", { class: "task-err", hidden: true });
+    c.filesInfo = h("span", { class: "muted small" });
+    c.jump = h("button", { class: "btn sm ghost", type: "button", onclick: () => jumpToActive(c) }, "받는 중인 파일로 이동");
+    c.filesBar = h("div", { class: "tfile-bar" }, c.filesInfo, h("span", { class: "spacer" }), c.jump);
+    c.filesList = h("div", { class: "task-files" });
+    c.filesWrap = h("div", { hidden: true }, c.filesBar, c.filesList);
+    c.el = h("div", { class: "task" },
+      h("div", { class: "task-head" }, c.statusTag, c.kindTag, c.title, h("span", { class: "spacer" }), c.actions),
+      c.lane, h("div", { class: "row", style: { gap: "14px", marginTop: "8px", alignItems: "baseline" } }, c.meta, c.toggle),
+      c.err, c.filesWrap);
+    return c;
+  }
+
+  function renderActions(c, t) {
+    const running = ["queued", "running"].includes(t.status);
+    const key = running ? "run" : (t.status === "done" ? "done" : "retry");
+    if (c.actionsKey === key) return;
+    c.actionsKey = key;
+    c.actions.replaceChildren(
+      running
+        ? h("button", { class: "btn sm", onclick: (e) => busy(e.currentTarget, async () => { await POST(`/api/tasks/${c.id}/stop`); tick(); }) }, icon("stop"), "중지")
+        : h("button", { class: "btn sm", onclick: (e) => busy(e.currentTarget, async () => { await POST(`/api/tasks/${c.id}/retry`); tick(); }) }, icon("play"), key === "done" ? "다시 실행" : "이어받기"),
+      h("button", { class: "icon-btn plain", title: "로그", onclick: () => logDialog(c.id) }, icon("log")),
+      h("button", { class: "icon-btn plain", title: "더 보기", onclick: (e) => {
+        const t2 = c.t;   // 메뉴를 여는 시점의 최신 상태 사용
+        popMenu(e.currentTarget, [
+          t2.meta && t2.meta.saveto ? { label: "저장 폴더 열기 (NAS 파일)", onClick: () => openLocal(t2.meta.saveto) } : null,
+          t2.meta && t2.meta.dest ? { label: "넷디스크 폴더 열기", onClick: () => go("files", { path: t2.meta.dest }) } : null,
+          { label: "명령어 복사", onClick: () => copyText("BaiduPCS-Go " + t2.args.map((a) => /\s/.test(a) ? `"${a}"` : a).join(" ")) },
+          "-",
+          { label: "기록에서 삭제", danger: true, onClick: async () => {
+            if (c.t.status === "running" && !await confirmBox("작업 삭제", "진행 중인 작업을 중지하고 삭제할까요?", { danger: true })) return;
+            await api("DELETE", `/api/tasks/${c.id}`); tick();
+          } },
+        ].filter(Boolean));
+      } }, icon("more")));
+  }
+
+  function fileRow(c, f) {
+    let r = c.rows.get(f.id);
+    if (!r) {
+      r = { name: h("span", { class: "n" }), sub: h("small"), fill: h("i"), stateEl: h("div", { class: "r" }) };
+      r.mini = h("div", { class: "mini" }, r.fill);
+      r.p = h("div", { class: "p" }, r.name, r.sub);
+      r.el = h("div", { class: "tfile" }, r.p, r.mini, r.stateEl);
+      r.el.dataset.fid = f.id;
+      c.rows.set(f.id, r);
+    }
+    const fp = f.total ? (f.done / f.total) * 100 : (f.state === "done" ? 100 : 0);
+    setText(r.name, baseName(f.path || f.save_path || "#" + f.id));
+    if (r.p.title !== (f.path || "")) r.p.title = f.path || "";
+    setText(r.sub, f.message || parentPath(f.path || ""));
+    setClass(r.mini, `mini ${f.state === "done" || f.state === "skipped" ? "done" : ""} ${f.state === "failed" ? "failed" : ""}`.trim());
+    setWidth(r.fill, fp);
+    const pctText = f.state === "running" && f.total ? ` ${fp.toFixed(1)}%` : "";
+    setText(r.stateEl, (FSTATE[f.state] || f.state) + pctText
+      + (f.state === "running" && f.speed ? ` · ${fmtSize(f.speed)}/s` : "")
+      + (f.total ? ` · ${fmtSize(f.total)}` : ""));
+    setClass(r.el, `tfile ${f.state === "running" ? "active" : ""} ${f.state === "failed" ? "bad" : ""}`.trim());
+    return r;
+  }
+
+  function renderFiles(c, t) {
+    const files = hideDone ? t.files.filter((f) => !["done", "skipped"].includes(f.state)) : t.files;
+    const keep = new Set(files.map((f) => f.id));
+    // 사라진 행 제거
+    for (const [fid, r] of c.rows) if (!keep.has(fid)) { r.el.remove(); c.rows.delete(fid); }
+    // 순서대로 배치 (이미 제자리에 있으면 DOM 을 건드리지 않음 → 스크롤 유지)
+    let prev = null;
+    for (const f of files) {
+      const r = fileRow(c, f);
+      const expected = prev ? prev.nextSibling : c.filesList.firstChild;
+      if (expected !== r.el) c.filesList.insertBefore(r.el, expected);
+      prev = r.el;
+    }
+    const doneCount = t.files.filter((f) => ["done", "skipped"].includes(f.state)).length;
+    setText(c.filesInfo, `파일 ${t.files.length}개 · 완료 ${doneCount}개` + (hideDone && doneCount ? " (완료 숨김)" : ""));
+    c.jump.hidden = !t.files.some((f) => f.state === "running");
+    if (!files.length) {
+      if (!c.emptyNote) c.emptyNote = h("div", { class: "muted small", style: { padding: "10px 12px" } }, "표시할 파일이 없습니다.");
+      if (!c.emptyNote.isConnected) c.filesList.append(c.emptyNote);
+    } else if (c.emptyNote && c.emptyNote.isConnected) c.emptyNote.remove();
+  }
+
+  function jumpToActive(c) {
+    const row = c.filesList.querySelector(".tfile.active") || c.filesList.querySelector(".tfile.bad");
+    if (row) c.filesList.scrollTop = Math.max(0, row.offsetTop - 8);
+  }
+
+  function updateCard(c, t) {
+    c.t = t;
     const [label, tone] = STATUS[t.status] || [t.status, ""];
     const pct = t.total ? Math.min(100, (t.done / t.total) * 100) : (t.status === "done" ? 100 : 0);
-    const isOpen = open.has(t.id);
     const remaining = t.speed > 0 && t.total ? fmtDur((t.total - t.done) / t.speed) : "";
-    const kindLabel = { download: "다운로드", upload: "업로드", transfer: "링크 저장" }[t.kind] || t.kind;
-    const actions = [];
-    if (["queued", "running"].includes(t.status)) actions.push(h("button", { class: "btn sm", onclick: (e) => busy(e.currentTarget, async () => { await POST(`/api/tasks/${t.id}/stop`); tick(); }) }, icon("stop"), "중지"));
-    else actions.push(h("button", { class: "btn sm", onclick: (e) => busy(e.currentTarget, async () => { await POST(`/api/tasks/${t.id}/retry`); tick(); }) }, icon("play"), t.status === "done" ? "다시 실행" : "이어받기"));
-    actions.push(h("button", { class: "icon-btn plain", title: "로그", onclick: () => logDialog(t.id) }, icon("log")));
-    actions.push(h("button", { class: "icon-btn plain", title: "더 보기", onclick: (e) => popMenu(e.currentTarget, [
-      t.meta && t.meta.saveto ? { label: "저장 폴더 열기 (NAS 파일)", onClick: () => openLocal(t.meta.saveto) } : null,
-      t.meta && t.meta.dest ? { label: "넷디스크 폴더 열기", onClick: () => go("files", { path: t.meta.dest }) } : null,
-      { label: "명령어 복사", onClick: () => copyText("BaiduPCS-Go " + t.args.map((a) => /\s/.test(a) ? `"${a}"` : a).join(" ")) },
-      "-",
-      { label: "기록에서 삭제", danger: true, onClick: async () => { if (t.status === "running" && !await confirmBox("작업 삭제", "진행 중인 작업을 중지하고 삭제할까요?", { danger: true })) return; await api("DELETE", `/api/tasks/${t.id}`); tick(); } },
-    ].filter(Boolean)) }, icon("more")));
-
-    return h("div", { class: "task" },
-      h("div", { class: "task-head" },
-        h("span", { class: `tag ${tone}` }, label), h("span", { class: "tag" }, kindLabel),
-        h("span", { class: "task-title", title: t.title }, t.title),
-        h("span", { class: "spacer" }), ...actions),
-      h("div", { class: `lane ${t.status}` }, h("i", { style: { width: pct.toFixed(1) + "%" } })),
-      h("div", { class: "task-meta" },
-        h("span", null, t.total ? `${fmtSize(t.done)} / ${fmtSize(t.total)} (${pct.toFixed(1)}%)` : (t.status === "running" ? "파일 목록 확인 중" : "")),
-        t.status === "running" && t.speed ? h("span", null, `${fmtSize(t.speed)}/s`) : null,
-        remaining ? h("span", null, `남은 시간 ${remaining}`) : null,
-        t.count ? h("span", null, `파일 ${t.count_done}/${t.count}`) : null,
-        h("span", null, `시작 ${fmtTime(t.started_at || t.created_at)}`),
-        t.finished_at && t.started_at ? h("span", null, `소요 ${fmtDur(t.finished_at - t.started_at)}`) : null,
-        t.summary ? h("span", null, t.summary) : null,
-        t.files.length ? h("a", { href: "javascript:void 0", onclick: () => { isOpen ? open.delete(t.id) : open.add(t.id); store.set("openTasks", [...open]); tick(); } }, isOpen ? "파일 접기" : "파일 보기") : null),
-      t.error && t.status !== "done" ? h("div", { class: "task-err" }, t.error) : null,
-      isOpen ? h("div", { class: "task-files" }, t.files.map((f) => {
-        const fp = f.total ? (f.done / f.total) * 100 : (f.state === "done" ? 100 : 0);
-        return h("div", { class: "tfile" },
-          h("div", { class: "p", title: f.path }, baseName(f.path || f.save_path || "#" + f.id), h("small", null, f.message || parentPath(f.path || ""))),
-          h("div", { class: `mini ${f.state === "done" ? "done" : ""}` }, h("i", { style: { width: fp.toFixed(1) + "%" } })),
-          h("div", { class: "r" }, FSTATE[f.state] || f.state, f.state === "running" && f.speed ? ` · ${fmtSize(f.speed)}/s` : "", f.total ? ` · ${fmtSize(f.total)}` : ""));
-      })) : null);
+    setClass(c.statusTag, `tag ${tone}`); setText(c.statusTag, label);
+    setText(c.kindTag, kindLabel(t.kind));
+    setText(c.title, t.title); if (c.title.title !== t.title) c.title.title = t.title;
+    renderActions(c, t);
+    setClass(c.lane, `lane ${t.status}`); setWidth(c.laneFill, pct);
+    const parts = [
+      t.total ? `${fmtSize(t.done)} / ${fmtSize(t.total)} (${pct.toFixed(1)}%)` : (t.status === "running" ? "파일 목록 확인 중" : ""),
+      t.status === "running" && t.speed ? `${fmtSize(t.speed)}/s` : "",
+      remaining ? `남은 시간 ${remaining}` : "",
+      t.count ? `파일 ${t.count_done}/${t.count}` : "",
+      `시작 ${fmtTime(t.started_at || t.created_at)}`,
+      t.finished_at && t.started_at ? `소요 ${fmtDur(t.finished_at - t.started_at)}` : "",
+      t.summary || "",
+    ].filter(Boolean);
+    // 메타 정보는 span 개수를 맞춘 뒤 글자만 바꾼다
+    while (c.meta.children.length < parts.length) c.meta.append(h("span"));
+    while (c.meta.children.length > parts.length) c.meta.lastChild.remove();
+    parts.forEach((p, i) => setText(c.meta.children[i], p));
+    const isOpen = open.has(t.id);
+    c.toggle.hidden = !t.files.length;
+    setText(c.toggle, isOpen ? "파일 접기" : `파일 보기 (${t.files.length})`);
+    const showErr = !!(t.error && t.status !== "done");
+    c.err.hidden = !showErr; if (showErr) setText(c.err, t.error);
+    c.filesWrap.hidden = !(isOpen && t.files.length);
+    if (isOpen && t.files.length) renderFiles(c, t);
   }
 
-  let last = [];
   function render(tasks) {
-    last = tasks;
-    renderSeg(tasks);
+    lastTasks = tasks;
+    FILTERS.forEach(([k, l], i) => { setClass(segBtns[i], filter === k ? "active" : ""); setText(segBtns[i], `${l} ${tasks.filter((t) => match(t, k)).length}`); });
     const running = tasks.filter((t) => t.status === "running");
     const speed = running.reduce((a, t) => a + t.speed, 0);
-    summary.replaceChildren(
-      h("div", { class: "stat" }, h("strong", null, running.length), h("span", null, `진행 중 (동시 ${state.info ? state.info.max_concurrent_tasks : 1}개)`)),
-      h("div", { class: "stat" }, h("strong", null, tasks.filter((t) => t.status === "queued").length), h("span", null, "대기 중")),
-      h("div", { class: "stat" }, h("strong", null, speed ? fmtSize(speed) + "/s" : "—"), h("span", null, "현재 속도")),
-      h("span", { class: "spacer" }),
-      h("button", { class: "btn", onclick: () => go("files") }, icon("download"), "넷디스크에서 받기"));
+    setText(sumRunning, running.length);
+    setText(sumRunningLabel, `진행 중 (동시 ${state.info ? state.info.max_concurrent_tasks : 1}개)`);
+    setText(sumQueued, tasks.filter((t) => t.status === "queued").length);
+    setText(sumSpeed, speed ? fmtSize(speed) + "/s" : "—");
+
     const shown = tasks.filter((t) => match(t, filter));
-    listEl.replaceChildren(...(shown.length ? shown.map(taskCard) : [h("div", { class: "empty" },
-      h("h3", null, tasks.length ? "이 조건에 맞는 작업이 없습니다" : "아직 전송 작업이 없습니다"),
-      h("p", null, "내 넷디스크에서 파일을 고르고 다운로드를 누르면 여기에 표시됩니다."))]));
+    const ids = new Set(shown.map((t) => t.id));
+    for (const [id, c] of cards) if (!ids.has(id)) { c.el.remove(); cards.delete(id); }
+    let prev = null;
+    for (const t of shown) {
+      let c = cards.get(t.id);
+      if (!c) { c = createCard(t); cards.set(t.id, c); }
+      updateCard(c, t);
+      const expected = prev ? prev.nextSibling : listEl.firstChild;
+      if (expected !== c.el) listEl.insertBefore(c.el, expected);
+      prev = c.el;
+    }
+    emptyEl.hidden = shown.length > 0;
+    if (!shown.length) setText(emptyEl.firstChild, tasks.length ? "이 조건에 맞는 작업이 없습니다" : "아직 전송 작업이 없습니다");
+    if (emptyEl !== listEl.lastChild) listEl.append(emptyEl);
   }
+  function rerender() { render(lastTasks); }
 
   async function tick() {
+    if (document.hidden) return;   // 탭이 안 보이면 쉬기
     try {
       const r = await GET("/api/tasks");
       if (r.running !== state.running) { state.running = r.running; renderNav("tasks"); }
-      // 메뉴가 열려 있으면 다시 그리지 않음
-      if (!$(".menu")) render(r.tasks);
+      render(r.tasks);
     } catch { /* 무시 */ }
   }
+  const onVisible = () => { if (!document.hidden) tick(); };
+  document.addEventListener("visibilitychange", onVisible);
+  state.cleanup = () => document.removeEventListener("visibilitychange", onVisible);
   tick();
   state.timers.push(setInterval(tick, 1500));
 };

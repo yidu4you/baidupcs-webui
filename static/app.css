@@ -303,7 +303,7 @@ textarea.input { height: auto; min-height: 84px; padding: 9px 11px; resize: vert
 .task:first-child { border-top: 0; }
 .task-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .task-title { font-weight: 600; font-size: 15px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
-.task-meta { display: flex; gap: 14px; color: var(--muted); font-size: 12.5px; margin-top: 8px; flex-wrap: wrap; }
+.task-meta { display: flex; gap: 14px; color: var(--muted); font-size: 12.5px; flex-wrap: wrap; }
 .task-err { margin-top: 8px; color: var(--danger); font-size: 13px; word-break: break-all; }
 .lane { margin-top: 10px; height: 10px; border-radius: 5px; background: var(--surface-2); border: 1px solid var(--line); overflow: hidden; position: relative; }
 .lane i { position: absolute; inset: 0 auto 0 0; background: var(--accent); border-radius: 4px; transition: width .8s ease; }
@@ -312,16 +312,25 @@ textarea.input { height: auto; min-height: 84px; padding: 9px 11px; resize: vert
 .lane.failed i { background: var(--danger); }
 .lane.stopped i, .lane.interrupted i { background: var(--warn); }
 @keyframes lane { to { background-position: 22.6px 0; } }
-.task-files { margin-top: 12px; border: 1px solid var(--line); border-radius: var(--r-sm); max-height: 340px; overflow: auto; }
-.tfile { display: grid; grid-template-columns: 1fr 120px 160px; gap: 10px; align-items: center; padding: 7px 12px; border-top: 1px solid var(--line); font-size: 13px; }
+.task-files { margin-top: 12px; border: 1px solid var(--line); border-radius: var(--r-sm); max-height: min(60vh, 520px); overflow: auto; }
+.tfile { display: grid; grid-template-columns: minmax(0, 1fr) 110px 240px; gap: 10px; align-items: center; padding: 7px 12px; border-top: 1px solid var(--line); font-size: 13px; }
 .tfile:first-child { border-top: 0; }
 .tfile .p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tfile .p small { display: block; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
 .tfile .mini { height: 4px; background: var(--surface-2); border-radius: 2px; overflow: hidden; }
 .tfile .mini i { display: block; height: 100%; background: var(--accent); }
 .tfile .mini.done i { background: var(--ok); }
+.tfile .mini.failed i { background: var(--danger); }
+.tfile.active { background: var(--accent-soft); }
+.tfile.bad .r { color: var(--danger); }
+.tfile .p .n { display: block; overflow: hidden; text-overflow: ellipsis; }
+.tfile-bar { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
+.tfile-bar + .task-files { margin-top: 6px; }
+.task-files { position: relative; }
+.linkish { background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer; font-size: 12.5px; white-space: nowrap; }
+.linkish:hover { text-decoration: underline; }
 .tfile .r { text-align: right; color: var(--muted); font-size: 12px; white-space: nowrap; }
-@media (max-width: 720px) { .tfile { grid-template-columns: 1fr 90px; } .tfile .mini { display: none; } }
+@media (max-width: 720px) { .tfile { grid-template-columns: minmax(0, 1fr) auto; } .tfile .mini { display: none; } .tfile .r { white-space: normal; max-width: 140px; } }
 
 /* ------------------------------------------------------------ 로컬 업로드 */
 .dropzone {

@@ -2,6 +2,18 @@
 
 이 프로젝트는 [Semantic Versioning](https://semver.org/lang/ko/)을 따릅니다.
 
+## [Unreleased]
+
+### 고침
+- 전송 현황이 1.5초마다 목록 전체를 다시 그려서, 파일 목록 스크롤이 계속 맨 위로 돌아가던 문제.
+  이제 작업 카드와 파일 행을 그대로 두고 바뀐 값(진행률, 속도, 상태)만 고칩니다.
+  갱신 순간에 누른 버튼 클릭이 무시되거나 선택한 글자가 풀리던 문제도 함께 해결됩니다.
+
+### 추가
+- 전송 현황: “완료된 파일 숨기기”, “받는 중인 파일로 이동” 버튼, 파일 목록을 열면 받는 중인 파일로 자동 이동.
+- 받는 중인 파일 행 강조, 파일별 진행률(%) 표시, 실패한 파일 빨간색 표시.
+- 브라우저 탭이 보이지 않을 때는 상태 조회를 쉬어 NAS 부담을 줄임.
+
 ## [0.0.1] - 2026-11-27
 
 첫 공개 버전.
@@ -19,4 +31,5 @@
   티에바(贴吧) BDUSS 검증 실패 시 원인 안내와 검증 건너뛰기, 계정 전환
 - 웹 UI 비밀번호 인증, PUID/PGID 실행, Synology DSM 컨테이너 매니저용 docker-compose
 
+[Unreleased]: https://github.com/yidu4you/baidupcs-webui/compare/v0.0.1...HEAD
 [0.0.1]: https://github.com/yidu4you/baidupcs-webui/releases/tag/v0.0.1
